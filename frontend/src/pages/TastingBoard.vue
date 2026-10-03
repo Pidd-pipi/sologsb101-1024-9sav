@@ -10,6 +10,7 @@ import FilterBar, {
 } from '@/components/common/FilterBar.vue'
 import GradeTag from '@/components/common/GradeTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
+import SegmentTraceDialog from '@/components/segment/SegmentTraceDialog.vue'
 import { useAgingDays } from '@/hooks/useAgingDays'
 import { useMilkStore } from '@/stores/milkStore'
 import { useTastingStore, type TastingRow } from '@/stores/tastingStore'
@@ -129,6 +130,17 @@ const dueWithoutTasting = computed(() =>
 
 const stampedVersion = ref(readStampedDbVersion())
 
+const traceDialogVisible = ref(false)
+const traceBatchId = ref<string | null>(null)
+const traceBatch = computed(() =>
+  traceBatchId.value ? batches.value.find((batch) => batch.id === traceBatchId.value) ?? null : null
+)
+
+function openTrace(batchId: string): void {
+  traceBatchId.value = batchId
+  traceDialogVisible.value = true
+}
+
 async function refreshCounts(): Promise<void> {
   counts.value = await countAll()
 }
@@ -227,7 +239,7 @@ async function exportAll(): Promise<void> {
     tastingStore.markBackupNow()
     stampedVersion.value = readStampedDbVersion()
     ElMessage.success(
-      `已导出 ${result.fileName}（奶源 ${result.counts.milks} / 批次 ${result.counts.batches} / 转架 ${result.counts.turnings} / 环境 ${result.counts.environments} / 品评 ${result.counts.tastings}）`
+      `已导出 ${result.fileName}（奶源 ${result.counts.milks} / 批次 ${result.counts.batches} / 分段 ${result.counts.segments ?? 0} / 转架 ${result.counts.turnings} / 环境 ${result.counts.environments} / 品评 ${result.counts.tastings}）`
     )
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : '导出失败')
@@ -266,7 +278,7 @@ async function handleFileChange(event: Event): Promise<void> {
     await refreshCounts()
     await tastingStore.syncAllConclusions()
     ElMessage.success(
-      `导入完成（${overwriteImport.value ? '覆盖' : '追加'}）：奶源 ${result.milks} / 批次 ${result.batches} / 窖位 ${result.shelves} / 转架 ${result.turnings} / 环境 ${result.environments} / 品评 ${result.tastings}`
+      `导入完成（${overwriteImport.value ? '覆盖' : '追加'}）：奶源 ${result.milks} / 批次 ${result.batches} / 分段 ${result.segments ?? 0} / 窖位 ${result.shelves} / 转架 ${result.turnings} / 环境 ${result.environments} / 品评 ${result.tastings}`
     )
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : '导入失败')
@@ -399,9 +411,10 @@ async function resetAll(): Promise<void> {
         <el-table-column label="最近出库" width="120">
           <template #default="{ row }">{{ row.lastOutAt || '—' }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="180" fixed="right">
+        <el-table-column label="操作" width="260" fixed="right">
           <template #default="{ row }">
             <el-button text type="primary" @click="writeBack(row.batchId)">回写结论</el-button>
+            <el-button text @click="openTrace(row.batchId)">分段档案</el-button>
             <el-button text :icon="Download" @click="exportOneBatch(row.batchId)">导出批次</el-button>
           </template>
         </el-table-column>
@@ -469,6 +482,7 @@ async function resetAll(): Promise<void> {
       <div class="stat-row">
         <StatBadge label="奶源" :value="counts.milks ?? 0" suffix="条" icon="Files" size="small" />
         <StatBadge label="批次" :value="counts.batches ?? 0" suffix="条" icon="Grid" size="small" />
+        <StatBadge label="分段" :value="counts.segments ?? 0" suffix="段" icon="Files" size="small" />
         <StatBadge label="窖位" :value="counts.shelves ?? 0" suffix="条" icon="Box" size="small" />
         <StatBadge label="转架作业" :value="counts.turnings ?? 0" suffix="条" icon="Tickets" size="small" />
         <StatBadge label="环境记录" :value="counts.environments ?? 0" suffix="条" icon="Odometer" size="small" />
@@ -563,6 +577,7 @@ async function resetAll(): Promise<void> {
         <el-button type="primary" @click="submit">保存并回写结论</el-button>
       </template>
     </el-dialog>
+    <SegmentTraceDialog v-model="traceDialogVisible" :batch="traceBatch" />
   </section>
 </template>
 

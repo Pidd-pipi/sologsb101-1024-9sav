@@ -9,13 +9,17 @@ import FilterBar, {
   type FilterSelectConfig
 } from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
+import SegmentLayoutDialog from '@/components/segment/SegmentLayoutDialog.vue'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
+import { useSegmentStore } from '@/stores/segmentStore'
 import { TEMP_ZONES, createEmptyShelfFilter, type Shelf, type TempZone } from '@/types/shelf'
+import type { BatchSegment } from '@/types/segment'
 import { TEMP_RANGE, ZONE_COLOR } from '@/utils/temperature'
 
 const shelfStore = useShelfStore()
 const milkStore = useMilkStore()
+const segmentStore = useSegmentStore()
 
 const {
   shelves,
@@ -173,10 +177,10 @@ async function submitShelf(): Promise<void> {
 }
 
 async function removeShelf(shelf: Shelf): Promise<void> {
-  const hosted = shelfStore.batchesOfShelf(shelf.id).length
+  const hosted = shelfStore.segmentsOfShelf(shelf.id).length
   try {
     await ElMessageBox.confirm(
-      `删除窖位「${shelfStore.shelfLabel(shelf.id)}」后，其上 ${hosted} 个批次会被置为未上架（批次与子记录保留）。是否继续？`,
+      `删除窖位「${shelfStore.shelfLabel(shelf.id)}」后，其上 ${hosted} 个分段会被置为未落位（批次与段记录保留）。是否继续？`,
       '删除窖位确认',
       { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
     )
@@ -184,7 +188,7 @@ async function removeShelf(shelf: Shelf): Promise<void> {
     return
   }
   await shelfStore.removeShelf(shelf.id)
-  ElMessage.success('窖位已删除，关联批次已置为未上架')
+  ElMessage.success('窖位已删除，关联分段已置为未落位')
 }
 
 function openAssignDialog(shelfId?: string): void {
@@ -220,10 +224,19 @@ async function submitAssign(): Promise<void> {
   }
 }
 
-async function release(batchId: string): Promise<void> {
-  const result = await shelfStore.releaseBatch(batchId)
-  if (result.ok) ElMessage.success(result.message)
-  else ElMessage.warning(result.message)
+/** 释放单段：窖位卡片上的段标签关闭按钮 */
+async function releaseSegment(segment: BatchSegment): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `把「${batchShortName(segment.batchId)} 段${segment.seq}（${segment.blockCount} 块 / ${segment.weightKg}kg）」从当前窖位移除并释放 ${segment.blockCount} 块余量？`,
+      '下架段确认',
+      { type: 'warning', confirmButtonText: '移出该段', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  await segmentStore.removeSegment(segment.id)
+  ElMessage.success(`段${segment.seq} 已移出，窖位余量已释放`)
 }
 
 async function assignBatchTo(shelfId: string, batchId: string): Promise<void> {
@@ -232,8 +245,39 @@ async function assignBatchTo(shelfId: string, batchId: string): Promise<void> {
   else ElMessage.warning(result.message)
 }
 
-function batchesOnShelf(shelfId: string) {
-  return shelfStore.batchesOfShelf(shelfId)
+function segmentsOnShelf(shelfId: string): BatchSegment[] {
+  return shelfStore.segmentsOfShelf(shelfId)
+}
+
+function batchShortName(batchId: string): string {
+  const batch = milkStore.batches.find((item) => item.id === batchId)
+  return batch ? `${milkStore.milkNameOf(batch.milkId)}·${batch.cheeseType}` : '批次已删除'
+}
+
+const layoutDialogVisible = ref(false)
+const layoutBatchId = ref<string | null>(null)
+const layoutBatch = computed(() =>
+  layoutBatchId.value ? milkStore.batches.find((batch) => batch.id === layoutBatchId.value) ?? null : null
+)
+
+function openLayoutForBatch(batchId: string): void {
+  layoutBatchId.value = batchId
+  layoutDialogVisible.value = true
+}
+
+/** 从窖位卡片发起分段上架：打开分段落位对话框（默认带上未上架批次） */
+function openSegmentAssign(_shelfId: string): void {
+  const firstUnassigned = unassignedBatches.value[0]
+  if (firstUnassigned) {
+    openLayoutForBatch(firstUnassigned.id)
+    return
+  }
+  // 没有未上架批次时，允许挑一个在窖批次继续拆段 / 挪段
+  const firstBatch = milkStore.batches.find(
+    (batch) => batch.state !== '已出库' && batch.state !== '报废'
+  )
+  if (firstBatch) openLayoutForBatch(firstBatch.id)
+  else ElMessage.info('暂无可分段落位的批次')
 }
 
 function batchOptionLabel(batchId: string): string {
@@ -352,19 +396,21 @@ function batchOptionLabel(batchId: string): string {
           <p class="muted zone-range">适宜温度 {{ zoneRangeText(shelf.tempZone) }}</p>
 
           <div class="shelf-card__batches">
-            <template v-if="batchesOnShelf(shelf.id).length > 0">
+            <template v-if="segmentsOnShelf(shelf.id).length > 0">
               <el-tag
-                v-for="batch in batchesOnShelf(shelf.id)"
-                :key="batch.id"
+                v-for="segment in segmentsOnShelf(shelf.id)"
+                :key="segment.id"
                 type="success"
                 effect="plain"
+                size="small"
                 closable
-                @close="release(batch.id)"
+                class="shelf-card__seg"
+                @close="releaseSegment(segment)"
               >
-                {{ milkStore.milkNameOf(batch.milkId) }} · {{ batch.cheeseType }}
+                {{ batchShortName(segment.batchId) }} · 段{{ segment.seq }}（{{ segment.blockCount }}块）
               </el-tag>
             </template>
-            <span v-else class="muted">暂无批次</span>
+            <span v-else class="muted">暂无段落位</span>
           </div>
 
           <footer class="shelf-card__actions">
@@ -375,8 +421,9 @@ function batchOptionLabel(batchId: string): string {
               :disabled="(occupancyMap[shelf.id]?.free ?? 0) <= 0 || unassignedBatches.length === 0"
               @click="openAssignDialog(shelf.id)"
             >
-              上架
+              整批上架
             </el-button>
+            <el-button text :icon="Plus" @click="openSegmentAssign(shelf.id)">分段上架</el-button>
             <el-button text :icon="Edit" @click="openShelfDialog(shelf)">编辑</el-button>
             <el-button text type="danger" :icon="Delete" @click="removeShelf(shelf)">删除</el-button>
           </footer>
@@ -408,7 +455,7 @@ function batchOptionLabel(batchId: string): string {
           <template #default="{ row }">
             <el-select
               :model-value="''"
-              placeholder="选择窖位完成上架"
+              placeholder="选择窖位完成整批上架"
               style="width: 100%"
               @update:model-value="(value: string) => assignBatchTo(value, row.id)"
             >
@@ -420,6 +467,13 @@ function batchOptionLabel(batchId: string): string {
                 :disabled="(occupancyMap[shelf.id]?.free ?? 0) <= 0"
               />
             </el-select>
+          </template>
+        </el-table-column>
+        <el-table-column label="分段" width="110" fixed="right">
+          <template #default="{ row }">
+            <el-button text type="primary" :icon="Plus" @click="openLayoutForBatch(row.id)">
+              分段落位
+            </el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -509,6 +563,8 @@ function batchOptionLabel(batchId: string): string {
         <el-button type="primary" @click="submitAssign">确认上架</el-button>
       </template>
     </el-dialog>
+
+    <SegmentLayoutDialog v-model="layoutDialogVisible" :batch="layoutBatch" />
   </section>
 </template>
 

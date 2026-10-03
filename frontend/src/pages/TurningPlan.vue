@@ -21,6 +21,7 @@ import GradeTag from '@/components/common/GradeTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
+import { useSegmentStore } from '@/stores/segmentStore'
 import { useTurningStore, type TurningRow } from '@/stores/turningStore'
 import {
   TURNING_STATES,
@@ -35,6 +36,7 @@ import { addDays, toDateString } from '@/utils/temperature'
 const turningStore = useTurningStore()
 const milkStore = useMilkStore()
 const shelfStore = useShelfStore()
+const segmentStore = useSegmentStore()
 
 const { filteredRows, groupedRows, ready, filter, summary, todayRows, overdueRows, sortMode } =
   storeToRefs(turningStore)
@@ -51,6 +53,7 @@ const draggingId = ref<string | null>(null)
 
 const turningForm = reactive({
   batchId: '',
+  segmentIds: [] as string[],
   shelfId: '',
   doneAt: toDateString(new Date()),
   type: '转架' as TurningType,
@@ -61,6 +64,7 @@ const turningForm = reactive({
 
 const planForm = reactive({
   batchId: '',
+  segmentIds: [] as string[],
   shelfId: '',
   startAt: toDateString(new Date()),
   times: 4,
@@ -72,6 +76,15 @@ const planForm = reactive({
 
 const turningRules: FormRules = {
   batchId: [{ required: true, message: '请选择批次', trigger: 'change' }],
+  segmentIds: [
+    {
+      validator: (_rule: unknown, value: unknown, callback: (error?: Error) => void) => {
+        if (Array.isArray(value) && value.length > 0) callback()
+        else callback(new Error('请选择本次作业携带的段（至少一段）'))
+      },
+      trigger: 'change'
+    }
+  ],
   shelfId: [{ required: true, message: '请选择作业窖位', trigger: 'change' }],
   doneAt: [{ required: true, message: '请选择作业日期', trigger: 'change' }],
   type: [{ required: true, message: '请选择作业类型', trigger: 'change' }],
@@ -80,6 +93,15 @@ const turningRules: FormRules = {
 
 const planRules: FormRules = {
   batchId: [{ required: true, message: '请选择批次', trigger: 'change' }],
+  segmentIds: [
+    {
+      validator: (_rule: unknown, value: unknown, callback: (error?: Error) => void) => {
+        if (Array.isArray(value) && value.length > 0) callback()
+        else callback(new Error('请选择每次作业携带的段（至少一段）'))
+      },
+      trigger: 'change'
+    }
+  ],
   shelfId: [{ required: true, message: '请选择作业窖位', trigger: 'change' }],
   startAt: [{ required: true, message: '请选择首次作业日期', trigger: 'change' }],
   times: [{ required: true, message: '请填写作业次数', trigger: 'blur' }],
@@ -130,6 +152,30 @@ const shelfOptions = computed(() =>
   }))
 )
 
+/** 指定批次当前在窖段（作业只能携带在窖段） */
+function segmentOptionsOf(batchId: string) {
+  return segmentStore.activeSegmentsOf(batchId).map((segment) => ({
+    label: `段${segment.seq}（${segment.blockCount}块/${segment.weightKg}kg · ${shelfStore.shelfLabel(segment.shelfId)}）`,
+    value: segment.id
+  }))
+}
+
+const turningSegmentOptions = computed(() => segmentOptionsOf(turningForm.batchId))
+const planSegmentOptions = computed(() => segmentOptionsOf(planForm.batchId))
+
+/** 选段后把作业窖位默认带到第一段的当前窖位（可再改选目标窖位） */
+function onTurningBatchChange(): void {
+  turningForm.segmentIds = []
+  const first = segmentStore.activeSegmentsOf(turningForm.batchId)[0]
+  turningForm.shelfId = first?.shelfId ?? shelves.value[0]?.id ?? ''
+}
+
+function onPlanBatchChange(): void {
+  planForm.segmentIds = []
+  const first = segmentStore.activeSegmentsOf(planForm.batchId)[0]
+  planForm.shelfId = first?.shelfId ?? shelves.value[0]?.id ?? ''
+}
+
 /** 等间隔计划预览：首次日期 + 间隔天数 × 次数 */
 const planPreview = computed(() => {
   const times = Math.max(1, Math.min(8, Math.round(planForm.times)))
@@ -152,7 +198,9 @@ function resetFilter(): void {
 function resetTurningForm(): void {
   const firstBatch = batches.value[0]
   turningForm.batchId = firstBatch?.id ?? ''
-  turningForm.shelfId = firstBatch?.shelfId ?? shelves.value[0]?.id ?? ''
+  turningForm.segmentIds = firstBatch ? segmentStore.activeSegmentsOf(firstBatch.id).map((s) => s.id) : []
+  turningForm.shelfId =
+    segmentStore.activeSegmentsOf(firstBatch?.id ?? '')[0]?.shelfId ?? shelves.value[0]?.id ?? ''
   turningForm.doneAt = toDateString(new Date())
   turningForm.type = '转架'
   turningForm.brinePct = 18
@@ -164,6 +212,7 @@ function openTurningDialog(row?: TurningRow): void {
   if (row) {
     editingTurningId.value = row.turning.id
     turningForm.batchId = row.turning.batchId
+    turningForm.segmentIds = [...row.turning.segmentIds]
     turningForm.shelfId = row.turning.shelfId
     turningForm.doneAt = row.turning.doneAt
     turningForm.type = row.turning.type
@@ -194,7 +243,9 @@ async function submitTurning(): Promise<void> {
 function resetPlanForm(): void {
   const firstBatch = batches.value[0]
   planForm.batchId = firstBatch?.id ?? ''
-  planForm.shelfId = firstBatch?.shelfId ?? shelves.value[0]?.id ?? ''
+  planForm.segmentIds = firstBatch ? segmentStore.activeSegmentsOf(firstBatch.id).map((s) => s.id) : []
+  planForm.shelfId =
+    segmentStore.activeSegmentsOf(firstBatch?.id ?? '')[0]?.shelfId ?? shelves.value[0]?.id ?? ''
   planForm.startAt = toDateString(new Date())
   planForm.times = 4
   planForm.intervalDays = 14
@@ -232,10 +283,22 @@ async function removeTurning(row: TurningRow): Promise<void> {
 }
 
 async function sign(row: TurningRow, state: TurningState): Promise<void> {
-  const changed = await turningStore.setState(row.turning.id, state)
-  if (!changed) return
+  const result = await turningStore.setState(row.turning.id, state)
+  if (!result.ok) {
+    if (result.conflict) {
+      ElMessage.error(result.conflict)
+    } else {
+      ElMessage.warning('签署失败，请刷新后重试')
+    }
+    return
+  }
   if (state === '已完成') {
-    ElMessage.success(`已签署：${row.turning.type} ${row.turning.doneAt} → 已完成`)
+    const moved = row.turning.type === '转架' && row.turning.appliedAt === null
+    ElMessage.success(
+      moved
+        ? `已签署：携带段已转入 ${shelfStore.shelfLabel(row.turning.shelfId)}，窖位余量已重算`
+        : `已签署：${row.turning.type} ${row.turning.doneAt} → 已完成`
+    )
   } else if (state === '已跳过') {
     ElMessage.warning(`已跳过：${row.turning.type} ${row.turning.doneAt}`)
   } else {
@@ -464,7 +527,11 @@ function changeSort(value: string | number | boolean | undefined): void {
                 </div>
                 <div class="turn-item__meta">
                   <span>{{ row.batchLabel }}</span>
+                  <span class="seg-badge">{{ row.segmentLabel }}</span>
                   <span class="muted">{{ row.milkLabel }}</span>
+                  <span v-if="row.turning.type === '转架' && row.turning.fromShelfId" class="muted">
+                    {{ shelfStore.shelfLabel(row.turning.fromShelfId) }} →
+                  </span>
                   <span class="muted">{{ row.shelfLabel }}</span>
                   <span class="mono">盐水 {{ row.turning.brinePct }}%</span>
                   <span class="muted">操作人 {{ row.turning.operator }}</span>
@@ -517,7 +584,13 @@ function changeSort(value: string | number | boolean | undefined): void {
     >
       <el-form ref="turningFormRef" :model="turningForm" :rules="turningRules" label-width="120px">
         <el-form-item label="批次" prop="batchId">
-          <el-select v-model="turningForm.batchId" filterable placeholder="选择批次" style="width: 100%">
+          <el-select
+            v-model="turningForm.batchId"
+            filterable
+            placeholder="选择批次"
+            style="width: 100%"
+            @change="onTurningBatchChange"
+          >
             <el-option
               v-for="option in batchOptions"
               :key="option.value"
@@ -525,6 +598,24 @@ function changeSort(value: string | number | boolean | undefined): void {
               :value="option.value"
             />
           </el-select>
+        </el-form-item>
+        <el-form-item label="携带段" prop="segmentIds">
+          <el-select
+            v-model="turningForm.segmentIds"
+            multiple
+            collapse-tags
+            collapse-tags-tooltip
+            placeholder="只携带选中段作业；转架签署时仅这些段迁移"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="option in turningSegmentOptions"
+              :key="option.value"
+              :label="option.label"
+              :value="option.value"
+            />
+          </el-select>
+          <span v-if="turningSegmentOptions.length === 0" class="muted">该批次当前没有在窖段，请先在窖位页分段落位</span>
         </el-form-item>
         <el-form-item label="作业窖位" prop="shelfId">
           <el-select v-model="turningForm.shelfId" filterable placeholder="选择窖位" style="width: 100%">
@@ -573,7 +664,13 @@ function changeSort(value: string | number | boolean | undefined): void {
     <el-dialog v-model="planDialogVisible" title="生成等间隔作业计划" width="620px" destroy-on-close>
       <el-form ref="planFormRef" :model="planForm" :rules="planRules" label-width="130px">
         <el-form-item label="批次" prop="batchId">
-          <el-select v-model="planForm.batchId" filterable placeholder="选择批次" style="width: 100%">
+          <el-select
+            v-model="planForm.batchId"
+            filterable
+            placeholder="选择批次"
+            style="width: 100%"
+            @change="onPlanBatchChange"
+          >
             <el-option
               v-for="option in batchOptions"
               :key="option.value"
@@ -581,6 +678,24 @@ function changeSort(value: string | number | boolean | undefined): void {
               :value="option.value"
             />
           </el-select>
+        </el-form-item>
+        <el-form-item label="携带段" prop="segmentIds">
+          <el-select
+            v-model="planForm.segmentIds"
+            multiple
+            collapse-tags
+            collapse-tags-tooltip
+            placeholder="每次作业只携带选中段；空选不允许"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="option in planSegmentOptions"
+              :key="option.value"
+              :label="option.label"
+              :value="option.value"
+            />
+          </el-select>
+          <span v-if="planSegmentOptions.length === 0" class="muted">该批次当前没有在窖段，请先分段落位</span>
         </el-form-item>
         <el-form-item label="作业窖位" prop="shelfId">
           <el-select v-model="planForm.shelfId" filterable placeholder="选择窖位" style="width: 100%">
@@ -719,6 +834,14 @@ function changeSort(value: string | number | boolean | undefined): void {
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
+  font-size: 12px;
+}
+
+.seg-badge {
+  padding: 0 8px;
+  border-radius: 999px;
+  background: #f3e9d6;
+  color: #8a5a1c;
   font-size: 12px;
 }
 

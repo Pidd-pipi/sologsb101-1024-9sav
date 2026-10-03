@@ -11,8 +11,12 @@ export interface Turning {
   id: string
   /** 所属批次 id（外键 → Batch.id） */
   batchId: string
-  /** 作业窖位 id（外键 → Shelf.id） */
+  /** 本次作业携带的段 id 列表（外键 → BatchSegment.id）；空数组表示整批（历史数据兼容） */
+  segmentIds: string[]
+  /** 作业窖位 id（外键 → Shelf.id）。转架类型为该段转入窖位；翻面 / 擦洗为作业发生窖位 */
   shelfId: string
+  /** 转架前窖位：仅「转架」类型在段实际迁移时记录，留痕段从哪个窖位挪来 */
+  fromShelfId: string | null
   /** 作业日期（YYYY-MM-DD） */
   doneAt: string
   /** 作业类型 */
@@ -25,6 +29,8 @@ export interface Turning {
   state: TurningState
   /** 作业计划内的执行顺序，由拖拽排序写回，从 1 开始 */
   seq: number
+  /** 转架实际签署时间戳：用于转架历史排序与段 placedAt 回写，未迁移时为 null */
+  appliedAt: number | null
   createdAt: number
   updatedAt: number
 }
@@ -50,6 +56,8 @@ export function createEmptyTurningFilter(): TurningFilterState {
 /** 等间隔计划的生成入参 */
 export interface TurningPlanInput {
   batchId: string
+  /** 携带段 id 列表；空数组表示整批全部段 */
+  segmentIds: string[]
   shelfId: string
   /** 首次作业日期（YYYY-MM-DD） */
   startAt: string

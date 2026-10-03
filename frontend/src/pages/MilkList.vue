@@ -2,7 +2,7 @@
 import { computed, reactive, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
-import { Delete, Edit, Plus, Right } from '@element-plus/icons-vue'
+import { Delete, Edit, Files, Plus, Position, Right } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, {
   type FilterModel,
@@ -10,9 +10,12 @@ import FilterBar, {
 } from '@/components/common/FilterBar.vue'
 import GradeTag from '@/components/common/GradeTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
+import SegmentLayoutDialog from '@/components/segment/SegmentLayoutDialog.vue'
+import SegmentTraceDialog from '@/components/segment/SegmentTraceDialog.vue'
 import { useAgingDays } from '@/hooks/useAgingDays'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
+import { useSegmentStore } from '@/stores/segmentStore'
 import {
   BATCH_STATES,
   CHEESE_TYPES,
@@ -26,6 +29,7 @@ import { toDateString } from '@/utils/temperature'
 
 const milkStore = useMilkStore()
 const shelfStore = useShelfStore()
+const segmentStore = useSegmentStore()
 
 const { milks, batches, ready, filter, milkStatMap, overview } = storeToRefs(milkStore)
 const { occupancyPercent } = storeToRefs(shelfStore)
@@ -299,6 +303,32 @@ async function advance(batch: Batch, next: BatchState): Promise<void> {
   }
 }
 
+const layoutDialogVisible = ref(false)
+const traceDialogVisible = ref(false)
+const layoutBatch = ref<Batch | null>(null)
+const traceBatch = ref<Batch | null>(null)
+
+function openLayout(batch: Batch): void {
+  layoutBatch.value = batch
+  layoutDialogVisible.value = true
+}
+
+function openTrace(batch: Batch): void {
+  traceBatch.value = batch
+  traceDialogVisible.value = true
+}
+
+function segmentSummaryText(batch: Batch): string {
+  const summary = segmentStore.summaryOf(batch.id)
+  if (!summary.assigned) return ''
+  return `${summary.placedSegmentCount}段 / ${summary.totalBlocks}块 / ${summary.totalWeightKg}kg`
+}
+
+function isWeightImbalanced(batch: Batch): boolean {
+  const summary = segmentStore.summaryOf(batch.id)
+  return summary.assigned && !summary.weightBalanced
+}
+
 function nextStates(batch: Batch): BatchState[] {
   return milkStore.nextStates(batch.state)
 }
@@ -468,9 +498,32 @@ function remainText(row: BatchRow): string {
             <span class="mono">{{ row.batch.weightKg }} kg</span>
           </template>
         </el-table-column>
-        <el-table-column label="窖位" min-width="170">
+        <el-table-column label="窖位 / 分段" min-width="220">
           <template #default="{ row }">
-            <el-tag v-if="row.batch.shelfId" type="success" effect="plain">
+            <template v-if="segmentStore.summaryOf(row.batch.id).assigned">
+              <div class="seg-cell">
+                <el-tag
+                  v-for="segment in segmentStore.activeSegmentsOf(row.batch.id)"
+                  :key="segment.id"
+                  size="small"
+                  type="success"
+                  effect="plain"
+                  class="seg-cell__tag"
+                >
+                  段{{ segment.seq }}·{{ segment.blockCount }}块 →
+                  {{ shelfStore.shelfLabel(segment.shelfId) }}
+                </el-tag>
+              </div>
+              <span
+                class="seg-cell__sum"
+                :class="{ warn: isWeightImbalanced(row.batch) }"
+                :title="isWeightImbalanced(row.batch) ? '在窖段重量合计与入库重量不一致' : ''"
+              >
+                {{ segmentSummaryText(row.batch) }}
+                <template v-if="isWeightImbalanced(row.batch)"> · 重量不符</template>
+              </span>
+            </template>
+            <el-tag v-else-if="row.batch.shelfId" type="success" effect="plain">
               {{ shelfStore.shelfLabel(row.batch.shelfId) }}
             </el-tag>
             <el-tag v-else type="info" effect="plain">未上架</el-tag>
@@ -527,8 +580,18 @@ function remainText(row: BatchRow): string {
             <span v-else class="muted">已终态</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="160" fixed="right">
+        <el-table-column label="操作" width="280" fixed="right">
           <template #default="{ row }">
+            <el-button
+              text
+              type="primary"
+              :icon="Position"
+              :disabled="row.batch.state === '已出库' || row.batch.state === '报废'"
+              @click="openLayout(row.batch)"
+            >
+              分段
+            </el-button>
+            <el-button text :icon="Files" @click="openTrace(row.batch)">档案</el-button>
             <el-button text :icon="Edit" @click="openBatchDialog(row.batch)">编辑</el-button>
             <el-button text type="danger" :icon="Delete" @click="removeBatch(row.batch)">
               删除
@@ -646,6 +709,8 @@ function remainText(row: BatchRow): string {
         <el-button type="primary" @click="submitBatch">保存</el-button>
       </template>
     </el-dialog>
+    <SegmentLayoutDialog v-model="layoutDialogVisible" :batch="layoutBatch" />
+    <SegmentTraceDialog v-model="traceDialogVisible" :batch="traceBatch" />
   </section>
 </template>
 
@@ -653,5 +718,20 @@ function remainText(row: BatchRow): string {
 .warn {
   color: #c0392b;
   font-weight: 600;
+}
+
+.seg-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.seg-cell__tag {
+  justify-content: flex-start;
+}
+
+.seg-cell__sum {
+  font-size: 12px;
+  color: #8c8479;
 }
 </style>

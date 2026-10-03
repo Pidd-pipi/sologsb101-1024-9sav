@@ -6,6 +6,8 @@ export interface Environment {
   id: string
   /** 所属批次 id（外键 → Batch.id） */
   batchId: string
+  /** 归属段 id（外键 → BatchSegment.id）：温湿度记录认到段；整批统一记录时为 null */
+  segmentId: string | null
   /** 记录时间（YYYY-MM-DDTHH:mm） */
   recordedAt: string
   /** 温度 ℃ */

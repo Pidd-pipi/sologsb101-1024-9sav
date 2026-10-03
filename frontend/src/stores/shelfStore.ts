@@ -11,8 +11,9 @@ import {
   type ShelfOccupancy,
   type TempZone
 } from '@/types/shelf'
-import type { Batch } from '@/types/batch'
+import type { BatchSegment } from '@/types/segment'
 import { useMilkStore } from '@/stores/milkStore'
+import { useSegmentStore } from '@/stores/segmentStore'
 
 export interface NewShelfInput {
   room: string
@@ -24,14 +25,16 @@ export interface NewShelfInput {
 }
 
 /**
- * 熟成库窖位 store：维护货架列表、占用率派生值、当前选中库房与上架分配。
- * 上架时校验窖位余量并实时更新 occupied。
+ * 熟成库窖位 store：维护货架列表、占用率派生值、当前选中库房。
+ * 占用口径：窖位 occupied = 该窖位上全部「在窖段」块数合计（分段块数），
+ * 由 segmentStore 的事务化操作统一重算，本 store 只做派生展示。
  */
 export const useShelfStore = defineStore('shelf', () => {
   const shelvesTable = useIdbTable<Shelf>((database) => database.shelves, {
     sortByUpdatedAt: false
   })
   const milkStore = useMilkStore()
+  const segmentStore = useSegmentStore()
 
   const prefs = readUiPrefs()
   const filter = ref<ShelfFilterState>(createEmptyShelfFilter())
@@ -48,16 +51,23 @@ export const useShelfStore = defineStore('shelf', () => {
     Array.from(new Set(shelves.value.map((shelf) => shelf.room))).sort()
   )
 
-  /** 某窖位上的批次 */
-  function batchesOfShelf(shelfId: string): Batch[] {
-    return milkStore.batches.filter((batch) => batch.shelfId === shelfId)
+  /** 某窖位上的在窖段 */
+  function segmentsOfShelf(shelfId: string): BatchSegment[] {
+    return segmentStore.activeSegmentsByShelf[shelfId] ?? []
   }
 
-  /** 占用率：以「实际挂接的批次数」与 occupied 字段中的较大者为准，避免脏数据导致占用率偏低 */
+  /** 某窖位上的批次（按段去重） */
+  function batchesOfShelf(shelfId: string) {
+    const ids = new Set(segmentsOfShelf(shelfId).map((segment) => segment.batchId))
+    return milkStore.batches.filter((batch) => ids.has(batch.id))
+  }
+
+  /** 占用率：以「在窖段块数合计」为准（segmentStore.occupiedBlocksByShelf 为唯一口径） */
   const occupancies = computed<ShelfOccupancy[]>(() =>
     shelves.value.map((shelf) => {
-      const hosted = batchesOfShelf(shelf.id).length
-      const occupied = Math.max(shelf.occupied, hosted)
+      const bySegments = segmentStore.occupiedBlocksByShelf[shelf.id] ?? 0
+      // 兜底取 stored.occupied 的较大值，避免段表订阅尚未刷新或历史脏数据导致占用率偏低
+      const occupied = Math.max(shelf.occupied ?? 0, bySegments)
       const free = Math.max(0, shelf.capacity - occupied)
       const percent = shelf.capacity === 0 ? 100 : Math.round((occupied / shelf.capacity) * 100)
       return {
@@ -106,7 +116,7 @@ export const useShelfStore = defineStore('shelf', () => {
   )
   const totalOccupied = computed(() =>
     filteredShelves.value.reduce(
-      (sum, shelf) => sum + (occupancyMap.value[shelf.id]?.occupied ?? shelf.occupied),
+      (sum, shelf) => sum + (occupancyMap.value[shelf.id]?.occupied ?? shelf.occupied ?? 0),
       0
     )
   )
@@ -116,10 +126,13 @@ export const useShelfStore = defineStore('shelf', () => {
   const fullShelfCount = computed(
     () => filteredShelves.value.filter((shelf) => occupancyMap.value[shelf.id]?.full).length
   )
-  /** 未上架的批次（可分配窖位） */
-  const unassignedBatches = computed<Batch[]>(() =>
+  /** 未完成分段落位的批次（没有任何在窖段），可分配窖位 */
+  const unassignedBatches = computed(() =>
     milkStore.batches.filter(
-      (batch) => !batch.shelfId && batch.state !== '已出库' && batch.state !== '报废'
+      (batch) =>
+        !segmentStore.summaryOf(batch.id).assigned &&
+        batch.state !== '已出库' &&
+        batch.state !== '报废'
     )
   )
 
@@ -160,101 +173,61 @@ export const useShelfStore = defineStore('shelf', () => {
     await shelvesTable.update(id, patch)
   }
 
-  /** 级联删除：窖位 → 解除批次挂接（批次本身保留） */
+  /**
+   * 级联删除：窖位 → 其上在窖段全部置为未落位（shelfId=null，段保留），
+   * 随后重算受影响窖位占用。批次与段记录本身保留。
+   */
   async function removeShelf(id: string): Promise<void> {
-    await db.transaction('rw', [db.shelves, db.batches], async () => {
-      const hosted = await db.batches.where('shelfId').equals(id).toArray()
-      for (const batch of hosted) {
-        await db.batches.update(batch.id, { shelfId: null, updatedAt: Date.now() })
+    const now = Date.now()
+    await db.transaction('rw', [db.shelves, db.segments, db.batches], async () => {
+      const hosted = await db.segments.where('shelfId').equals(id).toArray()
+      const batchIds = new Set(hosted.map((segment) => segment.batchId))
+      for (const segment of hosted) {
+        await db.segments.update(segment.id, { shelfId: null, updatedAt: now })
       }
       await db.shelves.delete(id)
+      for (const batchId of batchIds) {
+        const first = (await db.segments.where('batchId').equals(batchId).toArray())
+          .filter((segment) => segment.state === '在窖')
+          .sort((a, b) => a.seq - b.seq)[0]
+        await db.batches.update(batchId, { shelfId: first?.shelfId ?? null, updatedAt: now })
+      }
     })
     if (currentShelfId.value === id) currentShelfId.value = null
   }
 
   /**
-   * 上架：校验窖位余量 → 更新 occupied → 回写批次 shelfId。
-   * 批次若已在别的窖位，会先从原窖位释放一块。
+   * 快速上架（兼容旧入口）：为整批建立唯一一个段（全部入库重量、1 块）落到指定窖位。
+   * 已有在窖段的批次请走「分段落位」；容量校验在 segmentStore 的事务内完成，
+   * 冲突时返回最新余量，保证两段不会共占一格。
    */
   async function assignBatch(batchId: string, shelfId: string): Promise<ShelfAssignResult> {
-    const shelf = shelves.value.find((item) => item.id === shelfId)
-    if (!shelf) return { ok: false, message: '窖位不存在，请刷新后重试' }
     const batch = milkStore.batches.find((item) => item.id === batchId)
     if (!batch) return { ok: false, message: '批次不存在，请刷新后重试' }
     if (batch.state === '已出库' || batch.state === '报废') {
       return { ok: false, message: `批次状态为「${batch.state}」，不能再上架` }
     }
-    if (batch.shelfId === shelfId) return { ok: false, message: '该批次已在此窖位上' }
-
-    // 余量校验以数据库中的最新占用数为准（并兜底取 store 中的较大值），避免快速连续上架时读到缓存值
-    const [liveRow, hosted] = await Promise.all([
-      db.shelves.get(shelfId),
-      db.batches.where('shelfId').equals(shelfId).count()
+    const existing = segmentStore.activeSegmentsOf(batchId)
+    if (existing.length > 0) {
+      return { ok: false, message: '该批次已分段落位，如需调整请使用「分段落位」' }
+    }
+    const result = await segmentStore.saveLayout(batchId, [
+      {
+        key: `new_${Date.now()}`,
+        seq: 1,
+        blockCount: 1,
+        weightKg: batch.weightKg,
+        shelfId
+      }
     ])
-    const live = liveRow ?? shelf
-    const occupiedNow = Math.max(live.occupied, hosted, occupancyMap.value[shelfId]?.occupied ?? 0)
-    if (occupiedNow >= live.capacity) {
-      return {
-        ok: false,
-        message: `${shelf.room} ${shelf.rackNo} 第 ${shelf.layerNo} 层已满（${occupiedNow}/${live.capacity}），请先腾挪或改选窖位`
-      }
-    }
-
-    const previousShelfId = batch.shelfId
-    const now = Date.now()
-    await db.transaction('rw', [db.shelves, db.batches], async () => {
-      if (previousShelfId) {
-        const previous = await db.shelves.get(previousShelfId)
-        if (previous) {
-          // 占用数按「移走后仍挂接在该窖位的批次数」重算，避免历史脏数据累积偏差
-          const remaining = await db.batches
-            .where('shelfId')
-            .equals(previousShelfId)
-            .and((item) => item.id !== batchId)
-            .count()
-          await db.shelves.update(previous.id, {
-            occupied: Math.max(0, Math.min(previous.capacity, remaining)),
-            updatedAt: now
-          })
-        }
-      }
-      await db.shelves.update(shelfId, {
-        occupied: Math.min(live.capacity, occupiedNow + 1),
-        updatedAt: now
-      })
-      await db.batches.update(batchId, {
-        shelfId,
-        state: batch.state === '凝乳' ? '熟成中' : batch.state,
-        updatedAt: now
-      })
-    })
-
-    return {
-      ok: true,
-      message: `已上架至 ${shelf.room} ${shelf.rackNo} 第 ${shelf.layerNo} 层（${Math.min(
-        live.capacity,
-        occupiedNow + 1
-      )}/${live.capacity}）`
-    }
+    return result.ok
+      ? { ...result, message: `已上架至 ${shelfLabel(shelfId)}：${result.message}` }
+      : result
   }
 
-  /** 下架：释放窖位占用并清空批次 shelfId */
+  /** 下架：整批在窖段全部移除并释放窖位余量 */
   async function releaseBatch(batchId: string): Promise<ShelfAssignResult> {
-    const batch = milkStore.batches.find((item) => item.id === batchId)
-    if (!batch) return { ok: false, message: '批次不存在，请刷新后重试' }
-    if (!batch.shelfId) return { ok: false, message: '该批次尚未上架' }
-    const shelfId = batch.shelfId
-    const now = Date.now()
-    await db.transaction('rw', [db.shelves, db.batches], async () => {
-      const shelf = await db.shelves.get(shelfId)
-      if (shelf) {
-        const hosted = await db.batches.where('shelfId').equals(shelfId).count()
-        const occupied = Math.max(0, Math.max(shelf.occupied, hosted) - 1)
-        await db.shelves.update(shelfId, { occupied, updatedAt: now })
-      }
-      await db.batches.update(batchId, { shelfId: null, updatedAt: now })
-    })
-    return { ok: true, message: `已下架，${shelfLabel(shelfId)} 释放 1 块余量` }
+    return segmentStore.releaseAll(batchId)
   }
 
   /** 按温区阈值给出窖位可用性说明，用于卡片提示 */
@@ -283,6 +256,7 @@ export const useShelfStore = defineStore('shelf', () => {
     occupancyOf,
     shelfLabel,
     batchesOfShelf,
+    segmentsOfShelf,
     setCurrentRoom,
     setCurrentShelf,
     patchFilter,

@@ -1,6 +1,7 @@
 import Dexie, { type Table } from 'dexie'
 import type { Milk } from '@/types/milk'
 import type { Batch } from '@/types/batch'
+import type { BatchSegment } from '@/types/segment'
 import type { Shelf } from '@/types/shelf'
 import type { Turning } from '@/types/turning'
 import type { Environment } from '@/types/environment'
@@ -11,7 +12,7 @@ import { addDays, diffDays } from '@/utils/temperature'
 export const DB_NAME = 'gbcheeseage'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 键名（仅存少量元数据，业务数据一律在 IndexedDB） */
 export const LS_KEYS = {
@@ -42,6 +43,7 @@ export interface BackupPayload {
   exportedAt: string
   milks: Milk[]
   batches: Batch[]
+  segments: BatchSegment[]
   shelves: Shelf[]
   turnings: Turning[]
   environments: Environment[]
@@ -57,6 +59,7 @@ export interface BatchArchive {
   batchId: string
   milks: Milk[]
   batches: Batch[]
+  segments: BatchSegment[]
   shelves: Shelf[]
   turnings: Turning[]
   environments: Environment[]
@@ -66,6 +69,7 @@ export interface BatchArchive {
 export class CheeseAgeDatabase extends Dexie {
   milks!: Table<Milk, string>
   batches!: Table<Batch, string>
+  segments!: Table<BatchSegment, string>
   shelves!: Table<Shelf, string>
   turnings!: Table<Turning, string>
   environments!: Table<Environment, string>
@@ -83,7 +87,7 @@ export class CheeseAgeDatabase extends Dexie {
       tastings: 'id, batchId, outAt, score, conclusion, updatedAt'
     })
     // v2：批次补 shelfId 索引与 conclusion 字段；转架表补 seq 排序索引；环境表补温区越界阈值快照
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         milks: 'id, farm, milkKind, collectedAt, updatedAt',
         batches: 'id, milkId, shelfId, cheeseType, targetDays, state, curdedAt, updatedAt',
@@ -143,6 +147,73 @@ export class CheeseAgeDatabase extends Dexie {
             if (!Number.isFinite(shelf.occupied) || shelf.occupied < 0) shelf.occupied = 0
           })
       })
+    // v3：批次分段——新增 segments 表；老批次按其 shelfId 生成唯一默认段（块数 1、重量=批次重量），
+    // 历史转架与环境记录回填到该默认段，窖位占用按段块数重算。
+    this.version(DB_VERSION)
+      .stores({
+        milks: 'id, farm, milkKind, collectedAt, updatedAt',
+        batches: 'id, milkId, shelfId, cheeseType, targetDays, state, curdedAt, updatedAt',
+        segments: 'id, batchId, shelfId, state, seq, updatedAt',
+        shelves: 'id, room, rackNo, tempZone, capacity, occupied, updatedAt',
+        turnings: 'id, batchId, shelfId, doneAt, type, state, seq, updatedAt',
+        environments: 'id, batchId, segmentId, recordedAt, anomaly, updatedAt',
+        tastings: 'id, batchId, outAt, score, conclusion, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now()
+        const batches = await tx.table<Batch>('batches').toArray()
+        const legacySegments: BatchSegment[] = []
+        const batchToSegment = new Map<string, string>()
+        batches.forEach((batch) => {
+          // 已出库批次同样保留一个段，便于追溯其最后窖位与历史记录
+          const segmentId = `seg_${batch.id}`
+          batchToSegment.set(batch.id, segmentId)
+          legacySegments.push({
+            id: segmentId,
+            batchId: batch.id,
+            seq: 1,
+            blockCount: 1,
+            weightKg: batch.weightKg,
+            shelfId: batch.shelfId ?? null,
+            state: batch.state === '已出库' ? '已出库' : batch.state === '报废' ? '在窖' : '在窖',
+            mergedIntoId: null,
+            placedAt: batch.updatedAt ?? now,
+            createdAt: batch.createdAt ?? now,
+            updatedAt: now
+          })
+        })
+        await tx.table<BatchSegment>('segments').bulkPut(legacySegments)
+
+        await tx.table<Turning>('turnings').toCollection().modify((turning) => {
+          const segmentId = batchToSegment.get(turning.batchId)
+          turning.segmentIds = segmentId ? [segmentId] : []
+          turning.fromShelfId = null
+          turning.appliedAt = turning.state === '已完成' ? turning.updatedAt ?? now : null
+        })
+        await tx.table<Environment>('environments').toCollection().modify((record) => {
+          record.segmentId = batchToSegment.get(record.batchId) ?? null
+        })
+
+        // 窖位占用按「在窖段块数」重算，废弃批次不计占用
+        const occupiedByShelf = new Map<string, number>()
+        legacySegments.forEach((segment) => {
+          if (segment.state !== '在窖' || !segment.shelfId) return
+          const batch = batches.find((item) => item.id === segment.batchId)
+          if (batch?.state === '报废') return
+          occupiedByShelf.set(
+            segment.shelfId,
+            (occupiedByShelf.get(segment.shelfId) ?? 0) + segment.blockCount
+          )
+        })
+        await tx
+          .table<Shelf>('shelves')
+          .toCollection()
+          .modify((shelf) => {
+            const occupied = Math.min(shelf.capacity, occupiedByShelf.get(shelf.id) ?? 0)
+            shelf.occupied = occupied
+            shelf.updatedAt = now
+          })
+      })
   }
 }
 
@@ -158,11 +229,20 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [
+      db.milks,
+      db.batches,
+      db.segments,
+      db.shelves,
+      db.turnings,
+      db.environments,
+      db.tastings
+    ],
     async () => {
       await Promise.all([
         db.milks.clear(),
         db.batches.clear(),
+        db.segments.clear(),
         db.shelves.clear(),
         db.turnings.clear(),
         db.environments.clear(),
@@ -180,15 +260,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表记录数统计，供品评页与 README 中的「本地数据概览」展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, batches, segments, shelves, turnings, environments, tastings] = await Promise.all([
     db.milks.count(),
     db.batches.count(),
+    db.segments.count(),
     db.shelves.count(),
     db.turnings.count(),
     db.environments.count(),
     db.tastings.count()
   ])
-  return { milks, batches, shelves, turnings, environments, tastings }
+  return { milks, batches, segments, shelves, turnings, environments, tastings }
 }
 
 /** 读取 localStorage 中的 UI 偏好 */
@@ -234,9 +315,10 @@ export function readLastBackupAt(): string | null {
 
 /** 组装全量导出快照 */
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, batches, segments, shelves, turnings, environments, tastings] = await Promise.all([
     db.milks.toArray(),
     db.batches.toArray(),
+    db.segments.toArray(),
     db.shelves.toArray(),
     db.turnings.toArray(),
     db.environments.toArray(),
@@ -248,6 +330,7 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     exportedAt: new Date().toISOString(),
     milks,
     batches,
+    segments,
     shelves,
     turnings,
     environments,
@@ -263,10 +346,19 @@ export async function importSnapshot(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [
+      db.milks,
+      db.batches,
+      db.segments,
+      db.shelves,
+      db.turnings,
+      db.environments,
+      db.tastings
+    ],
     async () => {
       await db.milks.bulkPut(payload.milks)
       await db.batches.bulkPut(payload.batches)
+      await db.segments.bulkPut(payload.segments ?? [])
       await db.shelves.bulkPut(payload.shelves)
       await db.turnings.bulkPut(payload.turnings)
       await db.environments.bulkPut(payload.environments)
@@ -276,6 +368,7 @@ export async function importSnapshot(
   return {
     milks: payload.milks.length,
     batches: payload.batches.length,
+    segments: payload.segments?.length ?? 0,
     shelves: payload.shelves.length,
     turnings: payload.turnings.length,
     environments: payload.environments.length,
@@ -396,6 +489,84 @@ export async function seedDatabase(): Promise<void> {
     }
   ]
 
+  // 分段演示：A 批 12.5kg 拆 7.0 + 5.5 两段（已出库，保留最后窖位）；
+  // B 批 9.8kg 拆 4.9 + 4.9 两段分放两个窖位；C 批 6.4kg 单段；D 批尚未分段落位。
+  const segA1Id = 'seg_alp01_1'
+  const segA2Id = 'seg_alp01_2'
+  const segB1Id = 'seg_alp02_1'
+  const segB2Id = 'seg_alp02_2'
+  const segC1Id = 'seg_ewe01_1'
+  const placedA1 = Date.UTC(2025, 2, 3, 8, 0, 0)
+  const movedA2 = Date.UTC(2025, 2, 9, 9, 30, 0)
+
+  const segments: BatchSegment[] = [
+    {
+      id: segA1Id,
+      batchId: batchAId,
+      seq: 1,
+      blockCount: 3,
+      weightKg: 7.0,
+      shelfId: 'shelf_a1',
+      state: '已出库',
+      mergedIntoId: null,
+      placedAt: placedA1,
+      createdAt: now,
+      updatedAt: now
+    },
+    {
+      id: segA2Id,
+      batchId: batchAId,
+      seq: 2,
+      blockCount: 2,
+      weightKg: 5.5,
+      shelfId: 'shelf_c1',
+      state: '已出库',
+      mergedIntoId: null,
+      placedAt: movedA2,
+      createdAt: now,
+      updatedAt: now
+    },
+    {
+      id: segB1Id,
+      batchId: batchBId,
+      seq: 1,
+      blockCount: 2,
+      weightKg: 4.9,
+      shelfId: 'shelf_b2',
+      state: '在窖',
+      mergedIntoId: null,
+      placedAt: Date.UTC(2025, 2, 11, 8, 0, 0),
+      createdAt: now,
+      updatedAt: now
+    },
+    {
+      id: segB2Id,
+      batchId: batchBId,
+      seq: 2,
+      blockCount: 2,
+      weightKg: 4.9,
+      shelfId: 'shelf_c1',
+      state: '在窖',
+      mergedIntoId: null,
+      placedAt: Date.UTC(2025, 2, 11, 8, 0, 0),
+      createdAt: now,
+      updatedAt: now
+    },
+    {
+      id: segC1Id,
+      batchId: batchCId,
+      seq: 1,
+      blockCount: 2,
+      weightKg: 6.4,
+      shelfId: 'shelf_a1',
+      state: '在窖',
+      mergedIntoId: null,
+      placedAt: Date.UTC(2025, 2, 7, 8, 0, 0),
+      createdAt: now,
+      updatedAt: now
+    }
+  ]
+
   const shelves: Shelf[] = [
     {
       id: 'shelf_a1',
@@ -415,7 +586,7 @@ export async function seedDatabase(): Promise<void> {
       layerNo: 2,
       tempZone: '冷区',
       capacity: 6,
-      occupied: 1,
+      occupied: 2,
       createdAt: now,
       updatedAt: now
     },
@@ -426,7 +597,7 @@ export async function seedDatabase(): Promise<void> {
       layerNo: 1,
       tempZone: '常温区',
       capacity: 10,
-      occupied: 0,
+      occupied: 2,
       createdAt: now,
       updatedAt: now
     }
@@ -436,52 +607,64 @@ export async function seedDatabase(): Promise<void> {
     {
       id: 'turn_a1',
       batchId: batchAId,
-      shelfId: 'shelf_a1',
+      segmentIds: [segA2Id],
+      shelfId: 'shelf_c1',
+      fromShelfId: 'shelf_b2',
       doneAt: '2025-03-09',
       type: '转架',
       brinePct: 18,
       operator: '陈默',
       state: '已完成',
       seq: 1,
+      appliedAt: movedA2,
       createdAt: now,
       updatedAt: now
     },
     {
       id: 'turn_a2',
       batchId: batchAId,
+      segmentIds: [segA1Id],
       shelfId: 'shelf_a1',
+      fromShelfId: null,
       doneAt: '2025-03-23',
       type: '翻面',
       brinePct: 18,
       operator: '陈默',
       state: '已完成',
       seq: 2,
+      appliedAt: null,
       createdAt: now,
       updatedAt: now
     },
     {
       id: 'turn_b1',
       batchId: batchBId,
-      shelfId: 'shelf_b2',
+      segmentIds: [segB2Id],
+      shelfId: 'shelf_a1',
+      fromShelfId: null,
       doneAt: '2025-03-17',
       type: '转架',
       brinePct: 22,
       operator: '周雨',
       state: '待执行',
       seq: 1,
+      appliedAt: null,
       createdAt: now,
       updatedAt: now
     },
     {
       id: 'turn_c1',
       batchId: batchCId,
+      segmentIds: [segC1Id],
       shelfId: 'shelf_a1',
+      fromShelfId: null,
       doneAt: '2025-03-13',
       type: '翻面',
       brinePct: 0,
       operator: '陈默',
       state: '已跳过',
       seq: 1,
+      appliedAt: null,
       createdAt: now,
       updatedAt: now
     }
@@ -491,6 +674,7 @@ export async function seedDatabase(): Promise<void> {
     {
       id: 'env_a1',
       batchId: batchAId,
+      segmentId: segA1Id,
       recordedAt: '2025-03-03T09:30',
       tempC: 11.5,
       humidityPct: 85,
@@ -502,6 +686,7 @@ export async function seedDatabase(): Promise<void> {
     {
       id: 'env_a2',
       batchId: batchAId,
+      segmentId: segA1Id,
       recordedAt: '2025-03-17T09:20',
       tempC: 15.8,
       humidityPct: 79,
@@ -513,6 +698,7 @@ export async function seedDatabase(): Promise<void> {
     {
       id: 'env_b1',
       batchId: batchBId,
+      segmentId: segB1Id,
       recordedAt: '2025-03-11T10:05',
       tempC: 7.2,
       humidityPct: 88,
@@ -522,8 +708,21 @@ export async function seedDatabase(): Promise<void> {
       updatedAt: now
     },
     {
+      id: 'env_b2',
+      batchId: batchBId,
+      segmentId: segB2Id,
+      recordedAt: '2025-03-12T10:20',
+      tempC: 15.1,
+      humidityPct: 87,
+      anomaly: false,
+      action: '',
+      createdAt: now,
+      updatedAt: now
+    },
+    {
       id: 'env_c1',
       batchId: batchCId,
+      segmentId: segC1Id,
       recordedAt: '2025-03-08T14:40',
       tempC: 12.1,
       humidityPct: 90,
@@ -587,10 +786,11 @@ export async function seedDatabase(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [db.milks, db.batches, db.segments, db.shelves, db.turnings, db.environments, db.tastings],
     async () => {
       await db.milks.bulkPut(milks)
       await db.batches.bulkPut(batches)
+      await db.segments.bulkPut(segments)
       await db.shelves.bulkPut(shelves)
       await db.turnings.bulkPut(turnings)
       await db.environments.bulkPut(environments)

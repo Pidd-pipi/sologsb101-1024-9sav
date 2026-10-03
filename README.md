@@ -42,9 +42,9 @@ docker compose up -d --build      # 代码改动后重新构建
 | 语言 | TypeScript（`strict: true`、`noUnusedLocals: true`） | `npm run build` 内含 `vue-tsc --noEmit` 类型检查，0 错误 |
 | UI 组件库 | Element Plus 2.x（含 `@element-plus/icons-vue`） | 表格、表单、对话框、进度条、滑块、标签 |
 | 构建工具 | Vite 6 | 开发服务器端口 22824 |
-| 状态管理 | Pinia（setup store） | `milkStore` / `shelfStore` / `turningStore` / `tastingStore` |
+| 状态管理 | Pinia（setup store） | `milkStore` / `shelfStore` / `segmentStore` / `turningStore` / `tastingStore` |
 | 路由 | Vue Router 4（history 模式） | nginx 侧配合 `try_files` 做 SPA fallback |
-| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 库名 `gbcheeseage`，结构版本 `DB_VERSION = 2`，含真实 `.upgrade()` 迁移 |
+| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 库名 `gbcheeseage`，结构版本 `DB_VERSION = 3`，含真实 `.upgrade()` 迁移 |
 | 图表 | 手写 SVG 折线（无额外依赖） | 温湿度双曲线 + 越界点标记 |
 | 拖拽排序 | HTML5 原生 `draggable` 事件 | 未引入 `vuedraggable` / `dnd-kit` 等任何新依赖 |
 | 容器化 | Docker 多阶段构建：`node:20-alpine` → `nginx:alpine` | 构建阶段执行类型检查与打包，运行阶段仅托管静态产物 |
@@ -82,9 +82,10 @@ sologsb101-1024/
     ├── tsconfig.json / vite.config.ts / index.html
     ├── public/favicon.svg
     └── src/
-        ├── types/                # milk.ts batch.ts shelf.ts turning.ts environment.ts tasting.ts
-        ├── stores/               # milkStore.ts shelfStore.ts turningStore.ts tastingStore.ts
+        ├── types/                # milk.ts batch.ts segment.ts shelf.ts turning.ts environment.ts tasting.ts
+        ├── stores/               # milkStore.ts shelfStore.ts segmentStore.ts turningStore.ts tastingStore.ts
         ├── components/common/    # GradeTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
+        ├── components/segment/   # SegmentLayoutDialog.vue SegmentTraceDialog.vue
         ├── hooks/                # useAgingDays.ts useIdbTable.ts
         ├── pages/                # MilkList.vue ShelfBoard.vue TurningPlan.vue EnvironmentView.vue TastingBoard.vue
         ├── router/index.ts       # 路由表 + 懒加载 + document.title
@@ -95,10 +96,10 @@ sologsb101-1024/
 
 | 路由 | 页面 | 主要职责 | 消费模型 |
 | --- | --- | --- | --- |
-| `/milk` | 奶源与批次台账 | 新建奶源与批次，按乳种 / 批次状态筛选并同步 URL query；按目标熟成天数自动算最早可出库日期；状态流转「凝乳 → 熟成中 → 已出库 / 报废」；级联删除奶源与批次 | Milk、Batch |
-| `/shelves` | 熟成库货架与窖位 | 库房 / 货架号 / 层号 / 温区 / 可放块数维护，占用率卡片与进度条；上架时按余量硬校验并实时更新 `occupied`；下架释放余量 | Shelf、Batch |
-| `/turnings` | 转架 / 翻面 / 擦洗作业 | 按批次生成等间隔计划（起始日 + 间隔天数 × 次数）；逐条签署「待执行 → 已完成 / 已跳过」；HTML5 原生拖拽调整同批次内顺序并写回 `seq` | Turning、Batch、Shelf |
-| `/environment` | 温湿度记录与曲线 | 按温区阈值自动判定越界并标异常，提示开窗 / 加湿措施；手写 SVG 温湿度双曲线 + 越界点；一键重算异常标记 | Environment、Batch、Shelf |
+| `/milk` | 奶源与批次台账 | 新建奶源与批次，按乳种 / 批次状态筛选并同步 URL query；按目标熟成天数自动算最早可出库日期；状态流转「凝乳 → 熟成中 → 已出库 / 报废」（出库自动把在窖段标记出库并释放窖位）；「分段」打开分段落位对话框，「档案」查看分段明细、转架历史、段环境记录与品评结论；级联删除奶源与批次 | Milk、Batch、BatchSegment |
+| `/shelves` | 熟成库货架与窖位 | 库房 / 货架号 / 层号 / 温区 / 可放块数维护，占用率卡片与进度条；窖位卡片按段展示占用（段标签可单个移出）；整批上架或「分段上架」打开分段落位对话框，容量在事务内硬校验并实时重算 `occupied` | Shelf、Batch、BatchSegment |
+| `/turnings` | 转架 / 翻面 / 擦洗作业 | 按批次生成等间隔计划（起始日 + 间隔天数 × 次数），新建 / 计划必须勾选携带段；逐条签署「待执行 → 已完成 / 已跳过」，转架签署在同事务内仅迁移携带段并重算窖位占用，目标窖位满则回滚保持待执行；HTML5 原生拖拽调整同批次内顺序并写回 `seq` | Turning、Batch、BatchSegment、Shelf |
+| `/environment` | 温湿度记录与曲线 | 记录可认到具体段（按段所在窖位温区判越界）或整批；按温区阈值自动判定异常并标异常，提示开窗 / 加湿措施；手写 SVG 温湿度双曲线 + 越界点；一键重算异常标记 | Environment、Batch、BatchSegment、Shelf |
 | `/tastings` | 出库品评与档案导出 | 外观 / 风味 / 质地三维打分，同批次均分回写批次结论；JSON 全量导出导入（覆盖 / 追加两种模式）、单批次档案导出、重置并重新播种 | Tasting 及全部模型 |
 
 `/` 与未匹配路径均重定向到 `/milk`；页面组件全部懒加载，`router.afterEach` 统一设置 `document.title`。
@@ -108,21 +109,32 @@ sologsb101-1024/
 ## 五、IndexedDB 与数据存储说明
 
 - **数据库名**：`gbcheeseage`（Dexie 实例定义在 `frontend/src/utils/db.ts`）。
-- **结构版本**：`DB_VERSION = 2`。
+- **结构版本**：`DB_VERSION = 3`。
   - `version(1)`：初版六张业务表与索引。
   - `version(2).stores(...).upgrade(async (tx) => {...})`：**真实迁移**——为 `batches` 补齐 `shelfId` / `conclusion` / 时间戳；按作业日期为历史 `turnings` 回填 `seq` 执行序号；把湿度越界的 `environments` 记录重算为异常并补默认措施；把 `shelves` 的负数容量与占用数归零。
-- **六张表**：
+  - `version(3).stores(...).upgrade(async (tx) => {...})`：**批次分段迁移**——新增 `segments` 表；为每个老批次按其 `shelfId` 生成唯一默认段（1 块、重量=批次入窖重量，已出库批次段保留最后窖位）；历史 `turnings` 回填 `segmentIds` / `fromShelfId` / `appliedAt`，历史 `environments` 回填 `segmentId`；窖位 `occupied` 按「在窖段块数合计」重算。
+- **七张表**：
 
 | 表 | 模型 | 关键字段 | 索引 |
 | --- | --- | --- | --- |
 | `milks` | Milk 奶源 | `farm` `milkKind`(牛/羊/水牛) `collectedAt` `fatPct` `proteinPct` `note` | id, farm, milkKind, collectedAt |
-| `batches` | Batch 生产批次 | `milkId` `curdedAt` `cheeseType`(硬质/软质/蓝纹/洗皮) `targetDays` `weightKg` `state` `shelfId` `conclusion` | id, milkId, shelfId, cheeseType, state, curdedAt |
-| `shelves` | Shelf 窖位 | `room` `rackNo` `layerNo` `tempZone`(冷区/中温区/常温区) `capacity` `occupied` | id, room, rackNo, tempZone, occupied |
-| `turnings` | Turning 转架作业 | `batchId` `shelfId` `doneAt` `type`(转架/翻面/擦洗) `brinePct` `operator` `state` `seq` | id, batchId, shelfId, doneAt, type, state, seq |
-| `environments` | Environment 环境记录 | `batchId` `recordedAt` `tempC` `humidityPct` `anomaly` `action` | id, batchId, recordedAt, anomaly |
+| `batches` | Batch 生产批次 | `milkId` `curdedAt` `cheeseType`(硬质/软质/蓝纹/洗皮) `targetDays` `weightKg` `state` `shelfId`(代表窖位) `conclusion` | id, milkId, shelfId, cheeseType, state, curdedAt |
+| `segments` | BatchSegment 批次分段 | `batchId` `seq` `blockCount`(块数) `weightKg` `shelfId` `state`(在窖/已出库/已合并) `mergedIntoId` `placedAt` | id, batchId, shelfId, state, seq |
+| `shelves` | Shelf 窖位 | `room` `rackNo` `layerNo` `tempZone`(冷区/中温区/常温区) `capacity` `occupied`(按段块数重算) | id, room, rackNo, tempZone, occupied |
+| `turnings` | Turning 转架作业 | `batchId` `segmentIds`(本次携带段) `shelfId`(转入/作业窖位) `fromShelfId` `doneAt` `type` `brinePct` `operator` `state` `seq` `appliedAt` | id, batchId, shelfId, doneAt, type, state, seq |
+| `environments` | Environment 环境记录 | `batchId` `segmentId`(认到段) `recordedAt` `tempC` `humidityPct` `anomaly` `action` | id, batchId, segmentId, recordedAt, anomaly |
 | `tastings` | Tasting 品评 | `batchId` `outAt` `appearance/flavor/texture` 描述 + 三维评分 `score` `conclusion` `taster` | id, batchId, outAt, score, conclusion |
 
-- **首屏自动播种**：`initDatabase()` 在 `db.open()` 后执行 `if ((await db.milks.count()) === 0) { await seedDatabase() }`，播种 3 层互相引用的演示数据（奶源 3 → 生产批次 4 → 转架 4 / 环境 4 / 品评 3），使用固定 id + `bulkPut`，**幂等**（重复调用不会产生重复记录）。
+### 分段落位（核心业务规则）
+
+- **按块拆段**：一个批次可拆成多个段，每段记录块数与重量并落位到各自窖位；段是窖位占用、转架携带范围与环境记录归属的最小单位。保存时强校验**各段重量合计 = 批次入库重量**（误差 ≤ 0.001kg），不守恒整笔拒绝且不写入。
+- **窖位占用口径唯一**：`shelves.occupied` 恒等于该窖位全部「在窖」段的块数合计；落位、转架、合并、出库、删除全部在同一个 Dexie 读写事务末尾重算受影响窖位，容量夹取到 `capacity`。
+- **两平板并发不共格**：两个标签页 / 平板同时把段落向同一窖位时，容量判定在 IndexedDB 事务内基于最新提交数据完成；容量不足整事务回滚，后到者收到「仅剩 X 块」的最新余量并重新选位，先写者占用保留，两段不会共占一格。
+- **转架只带指定段**：新建作业 / 等间隔计划必须勾选携带段；「转架」签署完成时在同事务内仅把这些段迁到作业窖位、重算两窖位占用，并留 `fromShelfId` / `appliedAt` 痕迹；翻面 / 擦洗不迁段。目标窖位满时签署回滚、作业保持待执行。
+- **环境记录认到段**：环境记录可挂具体段或整批；越界阈值按该段当前所在窖位温区判定，重算异常标记同样认段。
+- **出库合回批次结论**：品评仍按批次录入并均分回写 `batches.conclusion`；批次出库时其在窖段统一标记「已出库」并释放窖位（段档案保留最后窖位）。支持把多段合并到一个保留段（块数 / 重量合计，历史转架与环境记录改挂保留段）。分段明细、窖位占用与完整转架历史可在批次「档案」中随时查询。
+
+- **首屏自动播种**：`initDatabase()` 在 `db.open()` 后执行 `if ((await db.milks.count()) === 0) { await seedDatabase() }`，播种 3 层互相引用的演示数据（奶源 3 → 生产批次 4 → 分段 5 → 转架 4 / 环境 5 / 品评 3；其中一个硬质批次演示同批两段分放两个窖位、一次只带第二段完成转架），使用固定 id + `bulkPut`，**幂等**（重复调用不会产生重复记录）。
 - **localStorage**：仅存元数据 —— `gbcheeseage:db-version`（本地结构版本）、`gbcheeseage:last-backup-at`（最近一次导出时间）、`gbcheeseage:ui-prefs`（当前库房、作业排序方式、曲线指标）。
 - **导出 / 导入**：`frontend/src/utils/export.ts` 提供 `exportSnapshotJson()`（全量）、`exportBatchArchiveJson(batchId)`（单批次档案）与 `parseSnapshotJson()` 校验（校验 `app` 字段、各集合数组、父子引用完整性，失败抛出原因且不写入任何数据）；`/tastings` 页支持「覆盖导入」与「追加导入（重新分配 id）」。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。

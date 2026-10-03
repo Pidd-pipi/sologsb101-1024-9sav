@@ -16,6 +16,7 @@ import {
   type BatchState,
   type CheeseType
 } from '@/types/batch'
+import { useSegmentStore } from '@/stores/segmentStore'
 import { computeAging } from '@/hooks/useAgingDays'
 import { toDateString } from '@/utils/temperature'
 
@@ -190,18 +191,48 @@ export const useMilkStore = defineStore('milk', () => {
     await milksTable.update(id, patch)
   }
 
-  /** 级联删除：奶源 → 批次 → 转架 / 环境 / 品评 */
+  /** 级联删除：奶源 → 批次 → 分段 → 转架 / 环境 / 品评；删除后按段重算窖位占用 */
   async function removeMilk(id: string): Promise<void> {
     const batchIds = batches.value.filter((batch) => batch.milkId === id).map((batch) => batch.id)
+    const affectedShelfIds = new Set<string>()
+    const now = Date.now()
     await db.transaction(
       'rw',
-      [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+      [
+        db.milks,
+        db.batches,
+        db.segments,
+        db.shelves,
+        db.turnings,
+        db.environments,
+        db.tastings
+      ],
       async () => {
+        const segments = await db.segments.where('batchId').anyOf(batchIds).toArray()
+        segments.forEach((segment) => {
+          if (segment.state === '在窖' && segment.shelfId) affectedShelfIds.add(segment.shelfId)
+        })
         await db.turnings.where('batchId').anyOf(batchIds).delete()
         await db.environments.where('batchId').anyOf(batchIds).delete()
         await db.tastings.where('batchId').anyOf(batchIds).delete()
+        await db.segments.where('batchId').anyOf(batchIds).delete()
         await db.batches.bulkDelete(batchIds)
         await db.milks.delete(id)
+        const onShelf = new Map<string, number>()
+        const rest = await db.segments.toArray()
+        rest.forEach((segment) => {
+          if (segment.state !== '在窖' || !segment.shelfId) return
+          onShelf.set(segment.shelfId, (onShelf.get(segment.shelfId) ?? 0) + segment.blockCount)
+        })
+        for (const shelfId of affectedShelfIds) {
+          const shelf = await db.shelves.get(shelfId)
+          if (shelf) {
+            await db.shelves.update(shelfId, {
+              occupied: Math.max(0, Math.min(shelf.capacity, onShelf.get(shelfId) ?? 0)),
+              updatedAt: now
+            })
+          }
+        }
       }
     )
     if (currentMilkId.value === id) currentMilkId.value = null
@@ -224,34 +255,50 @@ export const useMilkStore = defineStore('milk', () => {
     await batchesTable.update(id, { conclusion })
   }
 
-  /** 批次状态流转：凝乳 → 熟成中 → 已出库 / 报废 */
+  /** 批次状态流转：凝乳 → 熟成中 → 已出库 / 报废。流转到「已出库」时在窖段同步出库并释放窖位 */
   async function advanceBatchState(id: string, next: BatchState): Promise<boolean> {
     const batch = batches.value.find((item) => item.id === id)
     if (!batch) return false
     if (!BATCH_STATE_FLOW[batch.state].includes(next)) return false
+    if (next === '已出库') {
+      const result = await useSegmentStore().markShipped(id)
+      if (!result.ok) return false
+    }
     await batchesTable.update(id, { state: next })
     return true
   }
 
-  /** 级联删除：批次 → 转架 / 环境 / 品评 */
+  /** 级联删除：批次 → 分段 → 转架 / 环境 / 品评；删除后按段重算窖位占用 */
   async function removeBatch(id: string): Promise<boolean> {
     const batch = batches.value.find((item) => item.id === id)
     if (!batch) return false
+    const now = Date.now()
+    const affectedShelfIds = new Set<string>()
     await db.transaction(
       'rw',
-      [db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+      [db.batches, db.segments, db.shelves, db.turnings, db.environments, db.tastings],
       async () => {
+        const segments = await db.segments.where('batchId').equals(id).toArray()
+        segments.forEach((segment) => {
+          if (segment.state === '在窖' && segment.shelfId) affectedShelfIds.add(segment.shelfId)
+        })
         await db.turnings.where('batchId').equals(id).delete()
         await db.environments.where('batchId').equals(id).delete()
         await db.tastings.where('batchId').equals(id).delete()
+        await db.segments.where('batchId').equals(id).delete()
         await db.batches.delete(id)
-        // 已占用窖位释放一块
-        if (batch.shelfId) {
-          const shelf = await db.shelves.get(batch.shelfId)
+        const onShelf = new Map<string, number>()
+        const rest = await db.segments.toArray()
+        rest.forEach((segment) => {
+          if (segment.state !== '在窖' || !segment.shelfId) return
+          onShelf.set(segment.shelfId, (onShelf.get(segment.shelfId) ?? 0) + segment.blockCount)
+        })
+        for (const shelfId of affectedShelfIds) {
+          const shelf = await db.shelves.get(shelfId)
           if (shelf) {
-            await db.shelves.update(shelf.id, {
-              occupied: Math.max(0, shelf.occupied - 1),
-              updatedAt: Date.now()
+            await db.shelves.update(shelfId, {
+              occupied: Math.max(0, Math.min(shelf.capacity, onShelf.get(shelfId) ?? 0)),
+              updatedAt: now
             })
           }
         }

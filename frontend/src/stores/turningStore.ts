@@ -12,23 +12,29 @@ import {
   type TurningSummary
 } from '@/types/turning'
 import type { Batch } from '@/types/batch'
+import type { BatchSegment } from '@/types/segment'
 import type { Shelf } from '@/types/shelf'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
+import { useSegmentStore } from '@/stores/segmentStore'
 import { addDays, toDateString } from '@/utils/temperature'
 
-/** 转架作业行：作业 + 批次 + 窖位的展开结果，表格与拖拽列表共用 */
+/** 转架作业行：作业 + 批次 + 窖位 + 携带段的展开结果，表格与拖拽列表共用 */
 export interface TurningRow {
   turning: Turning
   batch: Batch | null
   shelf: Shelf | null
+  segments: BatchSegment[]
   batchLabel: string
   milkLabel: string
   shelfLabel: string
+  /** 携带段的简短文案，如「段1·3块 / 段2·2块」；空数组（历史整批）显示「整批」 */
+  segmentLabel: string
 }
 
 export interface NewTurningInput {
   batchId: string
+  segmentIds: string[]
   shelfId: string
   doneAt: string
   type: Turning['type']
@@ -47,6 +53,7 @@ export const useTurningStore = defineStore('turning', () => {
   })
   const milkStore = useMilkStore()
   const shelfStore = useShelfStore()
+  const segmentStore = useSegmentStore()
 
   const prefs = readUiPrefs()
   const filter = ref<TurningFilterState>(createEmptyTurningFilter())
@@ -84,13 +91,20 @@ export const useTurningStore = defineStore('turning', () => {
   const rows = computed<TurningRow[]>(() =>
     turnings.value.map((turning) => {
       const batch = batchOf(turning.batchId)
+      const segments = segmentStore.resolveTurningSegments(turning)
+      const segmentLabel =
+        turning.segmentIds.length === 0
+          ? '整批'
+          : segments.map((segment) => `段${segment.seq}·${segment.blockCount}块`).join(' / ')
       return {
         turning,
         batch,
+        segments,
         shelf: shelves.value.find((shelf) => shelf.id === turning.shelfId) ?? null,
         batchLabel: batchLabelOf(turning.batchId),
         milkLabel: milkLabelOf(turning.batchId),
-        shelfLabel: shelfStore.shelfLabel(turning.shelfId)
+        shelfLabel: shelfStore.shelfLabel(turning.shelfId),
+        segmentLabel
       }
     })
   )
@@ -100,7 +114,7 @@ export const useTurningStore = defineStore('turning', () => {
     const filtered = rows.value.filter((row) => {
       const keyword = filter.value.keyword.trim()
       if (keyword.length > 0) {
-        const haystack = `${row.turning.operator}${row.turning.type}${row.turning.state}${row.turning.doneAt}${row.batchLabel}${row.milkLabel}${row.shelfLabel}`
+        const haystack = `${row.turning.operator}${row.turning.type}${row.turning.state}${row.turning.doneAt}${row.batchLabel}${row.milkLabel}${row.shelfLabel}${row.segmentLabel}`
         if (!haystack.includes(keyword)) return false
       }
       if (filter.value.types.length > 0 && !filter.value.types.includes(row.turning.type)) return false
@@ -189,7 +203,16 @@ export const useTurningStore = defineStore('turning', () => {
   }
 
   async function createTurning(payload: NewTurningInput): Promise<Turning> {
-    return turningsTable.create({ ...payload, seq: nextSeq(payload.batchId) }, 'turn')
+    return turningsTable.create(
+      {
+        ...payload,
+        segmentIds: payload.segmentIds ?? [],
+        fromShelfId: null,
+        appliedAt: null,
+        seq: nextSeq(payload.batchId)
+      },
+      'turn'
+    )
   }
 
   async function updateTurning(id: string, patch: Partial<Turning>): Promise<void> {
@@ -202,27 +225,126 @@ export const useTurningStore = defineStore('turning', () => {
     if (turning) await normalizeSeq(turning.batchId)
   }
 
-  /** 逐条签署：待执行 → 已完成 / 已跳过（可回退为待执行） */
-  async function setState(id: string, state: TurningState): Promise<boolean> {
-    const turning = turnings.value.find((item) => item.id === id)
-    if (!turning) return false
-    await turningsTable.update(id, { state })
-    return true
+  /**
+   * 逐条签署：待执行 → 已完成 / 已跳过（可回退为待执行）。
+   * 「转架」类型首次签署完成时，在同一个事务内把其携带段迁移到作业窖位：
+   * 事务内重读目标窖位余量，容量不足则整事务回滚（作业仍为待执行），
+   * 由 UI 提示后到的平板重新选位；翻面 / 擦洗只改状态，不迁段。
+   * 返回 false 表示签署失败（含容量冲突），conflict 携带提示与最新余量。
+   */
+  async function setState(
+    id: string,
+    state: TurningState
+  ): Promise<{ ok: boolean; conflict?: string; shelfId?: string; free?: number }> {
+    // 以数据库中的最新作业为准（不依赖响应式缓存，避免刚新建即签署时读旧值）
+    const turning = await db.turnings.get(id)
+    if (!turning) return { ok: false }
+
+    // 仅「转架 + 待执行 → 已完成 + 尚未迁移」触发段迁移；翻面 / 擦洗 / 回退只改状态
+    const needsMove = turning.type === '转架' && state === '已完成' && turning.appliedAt === null
+    if (!needsMove) {
+      await db.turnings.update(id, { state, updatedAt: Date.now() })
+      return { ok: true }
+    }
+
+    const now = Date.now()
+    try {
+      await db.transaction('rw', [db.turnings, db.segments, db.shelves, db.batches], async () => {
+        const liveTurning = await db.turnings.get(id)
+        if (!liveTurning) throw new MoveConflict('作业已被删除，请刷新后重试')
+        // 可能已在另一个平板完成迁移：只同步状态，不再迁段
+        if (liveTurning.appliedAt !== null) {
+          await db.turnings.update(id, { state, updatedAt: now })
+          return
+        }
+
+        const target = await db.shelves.get(liveTurning.shelfId)
+        if (!target) throw new MoveConflict('目标窖位不存在，请刷新后重试')
+
+        const moving = new Set(
+          liveTurning.segmentIds.length > 0
+            ? liveTurning.segmentIds
+            : (await db.segments.where('batchId').equals(liveTurning.batchId).toArray())
+                .filter((segment) => segment.state === '在窖')
+                .map((segment) => segment.id)
+        )
+        const liveSegments = await db.segments.toArray()
+        const otherBlocks = liveSegments
+          .filter(
+            (segment) =>
+              segment.state === '在窖' &&
+              segment.shelfId === liveTurning.shelfId &&
+              !moving.has(segment.id)
+          )
+          .reduce((sum, segment) => sum + segment.blockCount, 0)
+        const members = liveSegments.filter((segment) => moving.has(segment.id))
+        const needBlocks = members
+          .filter((segment) => segment.state === '在窖' && segment.shelfId !== liveTurning.shelfId)
+          .reduce((sum, segment) => sum + segment.blockCount, 0)
+        if (otherBlocks + needBlocks > target.capacity) {
+          throw new MoveConflict(
+            `${target.room} ${target.rackNo} 第 ${target.layerNo} 层余量不足：仅剩 ${Math.max(
+              0,
+              target.capacity - otherBlocks
+            )} 块，本次转架要转入 ${needBlocks} 块。该作业保持待执行，请看到最新余量后重新选位`,
+            target.id,
+            Math.max(0, target.capacity - otherBlocks)
+          )
+        }
+
+        const affectedShelfIds = new Set<string>([liveTurning.shelfId])
+        let fromShelfId: string | null = null
+        for (const segment of members) {
+          if (segment.state !== '在窖') continue
+          if (segment.shelfId === liveTurning.shelfId) continue
+          if (segment.shelfId) {
+            affectedShelfIds.add(segment.shelfId)
+            fromShelfId = segment.shelfId
+          }
+          await db.segments.update(segment.id, {
+            shelfId: liveTurning.shelfId,
+            placedAt: now,
+            updatedAt: now
+          })
+        }
+        await segmentStore.recomputeShelfOccupancy(affectedShelfIds, now)
+        await db.turnings.update(id, {
+          state,
+          fromShelfId,
+          appliedAt: now,
+          updatedAt: now
+        })
+        // 同步批次代表窖位
+        const first = (await db.segments.where('batchId').equals(liveTurning.batchId).toArray())
+          .filter((segment) => segment.state === '在窖')
+          .sort((a, b) => a.seq - b.seq)[0]
+        await db.batches.update(liveTurning.batchId, {
+          shelfId: first?.shelfId ?? null,
+          updatedAt: now
+        })
+      })
+    } catch (err) {
+      if (err instanceof MoveConflict) {
+        return { ok: false, conflict: err.message, shelfId: err.shelfId, free: err.free }
+      }
+      throw err
+    }
+    return { ok: true }
   }
 
-  async function complete(id: string): Promise<boolean> {
+  async function complete(id: string) {
     return setState(id, '已完成')
   }
 
-  async function skip(id: string): Promise<boolean> {
+  async function skip(id: string) {
     return setState(id, '已跳过')
   }
 
-  async function reopen(id: string): Promise<boolean> {
+  async function reopen(id: string) {
     return setState(id, '待执行')
   }
 
-  /** 按批次生成等间隔作业计划：起始日 + 间隔天数 × 次数 */
+  /** 按批次生成等间隔作业计划：起始日 + 间隔天数 × 次数，携带指定段 */
   async function generatePlan(input: TurningPlanInput): Promise<number> {
     const times = Math.max(1, Math.min(24, Math.round(input.times)))
     const interval = Math.max(1, Math.round(input.intervalDays))
@@ -233,13 +355,16 @@ export const useTurningStore = defineStore('turning', () => {
       records.push({
         id: `${input.batchId}_plan_${now.toString(36)}_${index}`,
         batchId: input.batchId,
+        segmentIds: input.segmentIds ?? [],
         shelfId: input.shelfId,
+        fromShelfId: null,
         doneAt: addDays(input.startAt, index * interval),
         type: input.type,
         brinePct: input.brinePct,
         operator: input.operator,
         state: '待执行',
         seq: startSeq + index,
+        appliedAt: null,
         createdAt: now,
         updatedAt: now
       })
@@ -340,3 +465,16 @@ export const useTurningStore = defineStore('turning', () => {
 })
 
 export type TurningStore = ReturnType<typeof useTurningStore>
+
+/** 段转架容量冲突：携带冲突窖位最新余量，作业保持待执行，供 UI 提示重新选位 */
+class MoveConflict extends Error {
+  shelfId?: string
+  free?: number
+
+  constructor(message: string, shelfId?: string, free?: number) {
+    super(message)
+    this.name = 'MoveConflict'
+    this.shelfId = shelfId
+    this.free = free
+  }
+}
