@@ -6,6 +6,12 @@ export interface Environment {
   id: string
   /** 所属批次 id（外键 → Batch.id） */
   batchId: string
+  /**
+   * 记录针对的分段 id（外键 → Segment.id）。
+   * null 表示批次级记录（整批环境 / 历史数据）；非空表示认到具体段。
+   * 温区越界判定以该段所在窖位的温区为准。
+   */
+  segmentId: string | null
   /** 记录时间（YYYY-MM-DDTHH:mm） */
   recordedAt: string
   /** 温度 ℃ */

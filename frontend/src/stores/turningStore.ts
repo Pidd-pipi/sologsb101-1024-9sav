@@ -13,22 +13,27 @@ import {
 } from '@/types/turning'
 import type { Batch } from '@/types/batch'
 import type { Shelf } from '@/types/shelf'
+import type { Segment } from '@/types/segment'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
+import { useSegmentStore } from '@/stores/segmentStore'
 import { addDays, toDateString } from '@/utils/temperature'
 
-/** 转架作业行：作业 + 批次 + 窖位的展开结果，表格与拖拽列表共用 */
+/** 转架作业行：作业 + 批次 + 分段 + 窖位的展开结果，表格与拖拽列表共用 */
 export interface TurningRow {
   turning: Turning
   batch: Batch | null
+  segment: Segment | null
   shelf: Shelf | null
   batchLabel: string
   milkLabel: string
+  segmentLabel: string
   shelfLabel: string
 }
 
 export interface NewTurningInput {
   batchId: string
+  segmentId: string | null
   shelfId: string
   doneAt: string
   type: Turning['type']
@@ -39,6 +44,7 @@ export interface NewTurningInput {
 
 /**
  * 转架作业 store：维护作业计划、执行状态、拖拽顺序与统计派生值。
+ * 每条作业认到具体分段（segmentId），转架只带指定段；历史数据 segmentId 为空表示整批作业。
  * 拖拽排序结果写回 Dexie 的 seq 字段（同一批次内按 seq 升序）。
  */
 export const useTurningStore = defineStore('turning', () => {
@@ -47,6 +53,7 @@ export const useTurningStore = defineStore('turning', () => {
   })
   const milkStore = useMilkStore()
   const shelfStore = useShelfStore()
+  const segmentStore = useSegmentStore()
 
   const prefs = readUiPrefs()
   const filter = ref<TurningFilterState>(createEmptyTurningFilter())
@@ -68,6 +75,11 @@ export const useTurningStore = defineStore('turning', () => {
     return batches.value.find((batch) => batch.id === batchId) ?? null
   }
 
+  function segmentOf(segmentId: string | null): Segment | null {
+    if (!segmentId) return null
+    return segmentStore.segmentMap[segmentId] ?? null
+  }
+
   function batchLabelOf(batchId: string): string {
     const batch = batchOf(batchId)
     if (!batch) return '批次已删除'
@@ -80,16 +92,26 @@ export const useTurningStore = defineStore('turning', () => {
     return milkStore.milkNameOf(batch.milkId)
   }
 
+  function segmentLabelOf(segmentId: string | null): string {
+    if (!segmentId) return '整批'
+    const segment = segmentOf(segmentId)
+    if (!segment) return '分段已删除'
+    return `第 ${segment.blockNo} 段`
+  }
+
   /** 展开后的作业行，按 seq 升序（同一批次内） */
   const rows = computed<TurningRow[]>(() =>
     turnings.value.map((turning) => {
       const batch = batchOf(turning.batchId)
+      const segment = segmentOf(turning.segmentId)
       return {
         turning,
         batch,
+        segment,
         shelf: shelves.value.find((shelf) => shelf.id === turning.shelfId) ?? null,
         batchLabel: batchLabelOf(turning.batchId),
         milkLabel: milkLabelOf(turning.batchId),
+        segmentLabel: segmentLabelOf(turning.segmentId),
         shelfLabel: shelfStore.shelfLabel(turning.shelfId)
       }
     })
@@ -100,7 +122,7 @@ export const useTurningStore = defineStore('turning', () => {
     const filtered = rows.value.filter((row) => {
       const keyword = filter.value.keyword.trim()
       if (keyword.length > 0) {
-        const haystack = `${row.turning.operator}${row.turning.type}${row.turning.state}${row.turning.doneAt}${row.batchLabel}${row.milkLabel}${row.shelfLabel}`
+        const haystack = `${row.turning.operator}${row.turning.type}${row.turning.state}${row.turning.doneAt}${row.batchLabel}${row.milkLabel}${row.segmentLabel}${row.shelfLabel}`
         if (!haystack.includes(keyword)) return false
       }
       if (filter.value.types.length > 0 && !filter.value.types.includes(row.turning.type)) return false
@@ -222,7 +244,7 @@ export const useTurningStore = defineStore('turning', () => {
     return setState(id, '待执行')
   }
 
-  /** 按批次生成等间隔作业计划：起始日 + 间隔天数 × 次数 */
+  /** 按批次生成等间隔作业计划：起始日 + 间隔天数 × 次数，可指定分段 */
   async function generatePlan(input: TurningPlanInput): Promise<number> {
     const times = Math.max(1, Math.min(24, Math.round(input.times)))
     const interval = Math.max(1, Math.round(input.intervalDays))
@@ -233,6 +255,7 @@ export const useTurningStore = defineStore('turning', () => {
       records.push({
         id: `${input.batchId}_plan_${now.toString(36)}_${index}`,
         batchId: input.batchId,
+        segmentId: input.segmentId,
         shelfId: input.shelfId,
         doneAt: addDays(input.startAt, index * interval),
         type: input.type,
@@ -317,8 +340,10 @@ export const useTurningStore = defineStore('turning', () => {
     todayRows,
     overdueRows,
     batchOf,
+    segmentOf,
     batchLabelOf,
     milkLabelOf,
+    segmentLabelOf,
     setSortMode,
     setActiveBatch,
     patchFilter,

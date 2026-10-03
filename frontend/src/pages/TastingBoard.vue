@@ -12,6 +12,7 @@ import GradeTag from '@/components/common/GradeTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useAgingDays } from '@/hooks/useAgingDays'
 import { useMilkStore } from '@/stores/milkStore'
+import { useSegmentStore } from '@/stores/segmentStore'
 import { useTastingStore, type TastingRow } from '@/stores/tastingStore'
 import {
   SCORE_DIMENSIONS,
@@ -40,6 +41,7 @@ import { toDateString } from '@/utils/temperature'
 
 const tastingStore = useTastingStore()
 const milkStore = useMilkStore()
+const segmentStore = useSegmentStore()
 
 const { tastings, filteredRows, ready, filter, batchScores, avgScore, conclusionCounts, pendingBatches } =
   storeToRefs(tastingStore)
@@ -398,6 +400,14 @@ async function resetAll(): Promise<void> {
         </el-table-column>
         <el-table-column label="最近出库" width="120">
           <template #default="{ row }">{{ row.lastOutAt || '—' }}</template>
+        </el-table-column>
+        <el-table-column label="分段" width="110">
+          <template #default="{ row }">
+            <el-tag type="warning" effect="plain" size="small">
+              {{ segmentStore.segmentsOfBatch(row.batchId).length }} 段 · 落位
+              {{ segmentStore.weightBalanceOf(row.batchId)?.placedCount ?? 0 }}
+            </el-tag>
+          </template>
         </el-table-column>
         <el-table-column label="操作" width="180" fixed="right">
           <template #default="{ row }">

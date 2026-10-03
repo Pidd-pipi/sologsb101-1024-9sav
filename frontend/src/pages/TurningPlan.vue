@@ -21,6 +21,7 @@ import GradeTag from '@/components/common/GradeTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
+import { useSegmentStore } from '@/stores/segmentStore'
 import { useTurningStore, type TurningRow } from '@/stores/turningStore'
 import {
   TURNING_STATES,
@@ -35,6 +36,7 @@ import { addDays, toDateString } from '@/utils/temperature'
 const turningStore = useTurningStore()
 const milkStore = useMilkStore()
 const shelfStore = useShelfStore()
+const segmentStore = useSegmentStore()
 
 const { filteredRows, groupedRows, ready, filter, summary, todayRows, overdueRows, sortMode } =
   storeToRefs(turningStore)
@@ -51,6 +53,7 @@ const draggingId = ref<string | null>(null)
 
 const turningForm = reactive({
   batchId: '',
+  segmentId: null as string | null,
   shelfId: '',
   doneAt: toDateString(new Date()),
   type: '转架' as TurningType,
@@ -61,6 +64,7 @@ const turningForm = reactive({
 
 const planForm = reactive({
   batchId: '',
+  segmentId: null as string | null,
   shelfId: '',
   startAt: toDateString(new Date()),
   times: 4,
@@ -130,6 +134,52 @@ const shelfOptions = computed(() =>
   }))
 )
 
+/** 当前选中批次下的分段选项（含「整批」） */
+const segmentOptions = computed(() => {
+  const list = segmentStore.segmentsOfBatch(turningForm.batchId)
+  return [
+    { label: '整批（不指定段）', value: '' },
+    ...list.map((segment) => ({
+      label: `第 ${segment.blockNo} 段 · ${segment.weightKg}kg${
+        segment.shelfId ? ` · ${shelfStore.shelfLabel(segment.shelfId)}` : ' · 未上架'
+      }`,
+      value: segment.id
+    }))
+  ]
+})
+
+const planSegmentOptions = computed(() => {
+  const list = segmentStore.segmentsOfBatch(planForm.batchId)
+  return [
+    { label: '整批（不指定段）', value: '' },
+    ...list.map((segment) => ({
+      label: `第 ${segment.blockNo} 段 · ${segment.weightKg}kg`,
+      value: segment.id
+    }))
+  ]
+})
+
+/** 选择批次后，分段默认取第一段，窖位随分段所在窖位 */
+function onTurningBatchChange(batchId: string): void {
+  const segments = segmentStore.segmentsOfBatch(batchId)
+  turningForm.segmentId = segments[0]?.id ?? null
+  const segment = segmentStore.segmentMap[turningForm.segmentId ?? '']
+  if (segment?.shelfId) turningForm.shelfId = segment.shelfId
+}
+
+function onTurningSegmentChange(segmentId: string): void {
+  if (!segmentId) return
+  const segment = segmentStore.segmentMap[segmentId]
+  if (segment?.shelfId) turningForm.shelfId = segment.shelfId
+}
+
+function onPlanBatchChange(batchId: string): void {
+  const segments = segmentStore.segmentsOfBatch(batchId)
+  planForm.segmentId = segments[0]?.id ?? null
+  const segment = segmentStore.segmentMap[planForm.segmentId ?? '']
+  if (segment?.shelfId) planForm.shelfId = segment.shelfId
+}
+
 /** 等间隔计划预览：首次日期 + 间隔天数 × 次数 */
 const planPreview = computed(() => {
   const times = Math.max(1, Math.min(8, Math.round(planForm.times)))
@@ -152,7 +202,9 @@ function resetFilter(): void {
 function resetTurningForm(): void {
   const firstBatch = batches.value[0]
   turningForm.batchId = firstBatch?.id ?? ''
-  turningForm.shelfId = firstBatch?.shelfId ?? shelves.value[0]?.id ?? ''
+  turningForm.segmentId = segmentStore.segmentsOfBatch(turningForm.batchId)[0]?.id ?? null
+  const segment = segmentStore.segmentMap[turningForm.segmentId ?? '']
+  turningForm.shelfId = segment?.shelfId ?? firstBatch?.shelfId ?? shelves.value[0]?.id ?? ''
   turningForm.doneAt = toDateString(new Date())
   turningForm.type = '转架'
   turningForm.brinePct = 18
@@ -164,6 +216,7 @@ function openTurningDialog(row?: TurningRow): void {
   if (row) {
     editingTurningId.value = row.turning.id
     turningForm.batchId = row.turning.batchId
+    turningForm.segmentId = row.turning.segmentId
     turningForm.shelfId = row.turning.shelfId
     turningForm.doneAt = row.turning.doneAt
     turningForm.type = row.turning.type
@@ -182,10 +235,16 @@ async function submitTurning(): Promise<void> {
   const valid = await turningFormRef.value.validate().catch(() => false)
   if (!valid) return
   if (editingTurningId.value) {
-    await turningStore.updateTurning(editingTurningId.value, { ...turningForm })
+    await turningStore.updateTurning(editingTurningId.value, {
+      ...turningForm,
+      segmentId: turningForm.segmentId || null
+    })
     ElMessage.success('转架作业已更新')
   } else {
-    await turningStore.createTurning({ ...turningForm })
+    await turningStore.createTurning({
+      ...turningForm,
+      segmentId: turningForm.segmentId || null
+    })
     ElMessage.success('转架作业已新建')
   }
   turningDialogVisible.value = false
@@ -194,7 +253,9 @@ async function submitTurning(): Promise<void> {
 function resetPlanForm(): void {
   const firstBatch = batches.value[0]
   planForm.batchId = firstBatch?.id ?? ''
-  planForm.shelfId = firstBatch?.shelfId ?? shelves.value[0]?.id ?? ''
+  planForm.segmentId = segmentStore.segmentsOfBatch(planForm.batchId)[0]?.id ?? null
+  const segment = segmentStore.segmentMap[planForm.segmentId ?? '']
+  planForm.shelfId = segment?.shelfId ?? firstBatch?.shelfId ?? shelves.value[0]?.id ?? ''
   planForm.startAt = toDateString(new Date())
   planForm.times = 4
   planForm.intervalDays = 14
@@ -212,7 +273,10 @@ async function submitPlan(): Promise<void> {
   if (!planFormRef.value) return
   const valid = await planFormRef.value.validate().catch(() => false)
   if (!valid) return
-  const created = await turningStore.generatePlan({ ...planForm })
+  const created = await turningStore.generatePlan({
+    ...planForm,
+    segmentId: planForm.segmentId || null
+  })
   ElMessage.success(`已按等间隔生成 ${created} 条作业计划`)
   planDialogVisible.value = false
 }
@@ -465,6 +529,13 @@ function changeSort(value: string | number | boolean | undefined): void {
                 <div class="turn-item__meta">
                   <span>{{ row.batchLabel }}</span>
                   <span class="muted">{{ row.milkLabel }}</span>
+                  <el-tag
+                    :type="row.turning.segmentId ? 'warning' : 'info'"
+                    effect="plain"
+                    size="small"
+                  >
+                    {{ row.segmentLabel }}
+                  </el-tag>
                   <span class="muted">{{ row.shelfLabel }}</span>
                   <span class="mono">盐水 {{ row.turning.brinePct }}%</span>
                   <span class="muted">操作人 {{ row.turning.operator }}</span>
@@ -517,9 +588,31 @@ function changeSort(value: string | number | boolean | undefined): void {
     >
       <el-form ref="turningFormRef" :model="turningForm" :rules="turningRules" label-width="120px">
         <el-form-item label="批次" prop="batchId">
-          <el-select v-model="turningForm.batchId" filterable placeholder="选择批次" style="width: 100%">
+          <el-select
+            v-model="turningForm.batchId"
+            filterable
+            placeholder="选择批次"
+            style="width: 100%"
+            @change="onTurningBatchChange"
+          >
             <el-option
               v-for="option in batchOptions"
+              :key="option.value"
+              :label="option.label"
+              :value="option.value"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="作业分段">
+          <el-select
+            v-model="turningForm.segmentId"
+            filterable
+            placeholder="选择分段"
+            style="width: 100%"
+            @change="onTurningSegmentChange"
+          >
+            <el-option
+              v-for="option in segmentOptions"
               :key="option.value"
               :label="option.label"
               :value="option.value"
@@ -573,9 +666,25 @@ function changeSort(value: string | number | boolean | undefined): void {
     <el-dialog v-model="planDialogVisible" title="生成等间隔作业计划" width="620px" destroy-on-close>
       <el-form ref="planFormRef" :model="planForm" :rules="planRules" label-width="130px">
         <el-form-item label="批次" prop="batchId">
-          <el-select v-model="planForm.batchId" filterable placeholder="选择批次" style="width: 100%">
+          <el-select
+            v-model="planForm.batchId"
+            filterable
+            placeholder="选择批次"
+            style="width: 100%"
+            @change="onPlanBatchChange"
+          >
             <el-option
               v-for="option in batchOptions"
+              :key="option.value"
+              :label="option.label"
+              :value="option.value"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="作业分段">
+          <el-select v-model="planForm.segmentId" filterable placeholder="选择分段" style="width: 100%">
+            <el-option
+              v-for="option in planSegmentOptions"
               :key="option.value"
               :label="option.label"
               :value="option.value"

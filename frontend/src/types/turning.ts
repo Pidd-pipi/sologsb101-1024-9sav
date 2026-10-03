@@ -13,6 +13,11 @@ export interface Turning {
   batchId: string
   /** 作业窖位 id（外键 → Shelf.id） */
   shelfId: string
+  /**
+   * 作业针对的分段 id（外键 → Segment.id）。
+   * null 表示批次级作业（整批挪动 / 历史数据）；非空表示只带指定段。
+   */
+  segmentId: string | null
   /** 作业日期（YYYY-MM-DD） */
   doneAt: string
   /** 作业类型 */
@@ -50,6 +55,8 @@ export function createEmptyTurningFilter(): TurningFilterState {
 /** 等间隔计划的生成入参 */
 export interface TurningPlanInput {
   batchId: string
+  /** 针对的分段 id；null 表示整批（不指定段） */
+  segmentId: string | null
   shelfId: string
   /** 首次作业日期（YYYY-MM-DD） */
   startAt: string

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from 'vue'
 import { storeToRefs } from 'pinia'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import { Delete, Edit, Plus, Right } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
@@ -13,6 +14,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useAgingDays } from '@/hooks/useAgingDays'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
+import { useSegmentStore } from '@/stores/segmentStore'
 import {
   BATCH_STATES,
   CHEESE_TYPES,
@@ -26,6 +28,8 @@ import { toDateString } from '@/utils/temperature'
 
 const milkStore = useMilkStore()
 const shelfStore = useShelfStore()
+const segmentStore = useSegmentStore()
+const router = useRouter()
 
 const { milks, batches, ready, filter, milkStatMap, overview } = storeToRefs(milkStore)
 const { occupancyPercent } = storeToRefs(shelfStore)
@@ -314,6 +318,21 @@ function remainText(row: BatchRow): string {
   if (row.remainDays < 0) return `超期 ${Math.abs(row.remainDays)} 天`
   return `剩余 ${row.remainDays} 天`
 }
+
+/** 批次分段明细（按段号排序） */
+function segmentsOf(batchId: string) {
+  return segmentStore.segmentsOfBatch(batchId)
+}
+
+/** 重量守恒：各段合计 = 入库重量 */
+function balanceOf(batchId: string) {
+  return segmentStore.weightBalanceOf(batchId)
+}
+
+/** 前往货架窖位页分段落位 */
+function goSplit(): void {
+  void router.push('/shelves')
+}
 </script>
 
 <template>
@@ -474,6 +493,40 @@ function remainText(row: BatchRow): string {
               {{ shelfStore.shelfLabel(row.batch.shelfId) }}
             </el-tag>
             <el-tag v-else type="info" effect="plain">未上架</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="分段 / 重量" min-width="150">
+          <template #default="{ row }">
+            <el-popover placement="top" trigger="hover" width="280">
+              <template #reference>
+                <el-tag type="warning" effect="plain">
+                  {{ segmentsOf(row.batch.id).length }} 段 · 已落位
+                  {{ balanceOf(row.batch.id)?.placedCount ?? 0 }}
+                </el-tag>
+              </template>
+              <div class="seg-pop">
+                <div class="seg-pop__head">
+                  各段合计 {{ balanceOf(row.batch.id)?.totalWeightKg ?? 0 }}kg / 入库
+                  {{ row.batch.weightKg }}kg
+                  <el-tag
+                    :type="balanceOf(row.batch.id)?.balanced ? 'success' : 'danger'"
+                    size="small"
+                    effect="plain"
+                  >
+                    {{ balanceOf(row.batch.id)?.balanced ? '守恒' : '不等' }}
+                  </el-tag>
+                </div>
+                <ul class="seg-pop__list">
+                  <li v-for="seg in segmentsOf(row.batch.id)" :key="seg.id">
+                    <span>第 {{ seg.blockNo }} 段 · {{ seg.weightKg }}kg</span>
+                    <span class="muted">
+                      {{ seg.shelfId ? shelfStore.shelfLabel(seg.shelfId) : '未上架' }}
+                    </span>
+                  </li>
+                </ul>
+                <el-button text type="primary" @click="goSplit">去货架窖位分段落位</el-button>
+              </div>
+            </el-popover>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="100">
@@ -653,5 +706,32 @@ function remainText(row: BatchRow): string {
 .warn {
   color: #c0392b;
   font-weight: 600;
+}
+
+.seg-pop__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.seg-pop__list {
+  margin: 0 0 8px;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.seg-pop__list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 </style>

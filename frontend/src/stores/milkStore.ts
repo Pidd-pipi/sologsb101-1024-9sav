@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref, type ComputedRef } from 'vue'
-import { db } from '@/utils/db'
+import { db, createId } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import {
   createEmptyMilkFilter,
@@ -212,6 +212,19 @@ export const useMilkStore = defineStore('milk', () => {
       { ...payload, shelfId: null, conclusion: '' },
       'batch'
     )
+    // 同步创建首段（整批一块，未上架），保证各段重量合计 = 入库重量
+    const now = Date.now()
+    await db.segments.put({
+      id: createId('seg'),
+      batchId: batch.id,
+      blockNo: 1,
+      weightKg: payload.weightKg,
+      shelfId: null,
+      rev: 0,
+      note: '',
+      createdAt: now,
+      updatedAt: now
+    })
     return batch
   }
 
@@ -230,30 +243,50 @@ export const useMilkStore = defineStore('milk', () => {
     if (!batch) return false
     if (!BATCH_STATE_FLOW[batch.state].includes(next)) return false
     await batchesTable.update(id, { state: next })
+    // 出库 / 报废时释放该批次全部已落位分段（奶酪离开窖位）
+    if (next === '已出库' || next === '报废') {
+      const placed = await db.segments.where('batchId').equals(id).toArray()
+      const placedSegments = placed.filter((segment) => segment.shelfId !== null)
+      if (placedSegments.length > 0) {
+        const shelfIds = Array.from(new Set(placedSegments.map((s) => s.shelfId))) as string[]
+        const now = Date.now()
+        await db.transaction('rw', [db.segments, db.shelves], async () => {
+          for (const shelfId of shelfIds) {
+            const hosted = await db.segments.where('shelfId').equals(shelfId).count()
+            const releasing = placedSegments.filter((s) => s.shelfId === shelfId).length
+            await db.shelves.update(shelfId, {
+              occupied: Math.max(0, hosted - releasing),
+              updatedAt: now
+            })
+          }
+          for (const segment of placedSegments) {
+            await db.segments.update(segment.id, { shelfId: null, updatedAt: now })
+          }
+        })
+      }
+    }
     return true
   }
 
-  /** 级联删除：批次 → 转架 / 环境 / 品评 */
+  /** 级联删除：批次 → 分段 → 转架 / 环境 / 品评，并重算窖位占用 */
   async function removeBatch(id: string): Promise<boolean> {
     const batch = batches.value.find((item) => item.id === id)
     if (!batch) return false
     await db.transaction(
       'rw',
-      [db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+      [db.batches, db.segments, db.shelves, db.turnings, db.environments, db.tastings],
       async () => {
+        // 找出该批分段占用的窖位，删除后重算占用数
+        const placed = await db.segments.where('batchId').equals(id).toArray()
+        const shelfIds = Array.from(new Set(placed.map((s) => s.shelfId).filter(Boolean))) as string[]
         await db.turnings.where('batchId').equals(id).delete()
         await db.environments.where('batchId').equals(id).delete()
         await db.tastings.where('batchId').equals(id).delete()
+        await db.segments.where('batchId').equals(id).delete()
         await db.batches.delete(id)
-        // 已占用窖位释放一块
-        if (batch.shelfId) {
-          const shelf = await db.shelves.get(batch.shelfId)
-          if (shelf) {
-            await db.shelves.update(shelf.id, {
-              occupied: Math.max(0, shelf.occupied - 1),
-              updatedAt: Date.now()
-            })
-          }
+        for (const shelfId of shelfIds) {
+          const hosted = await db.segments.where('shelfId').equals(shelfId).count()
+          await db.shelves.update(shelfId, { occupied: hosted, updatedAt: Date.now() })
         }
       }
     )

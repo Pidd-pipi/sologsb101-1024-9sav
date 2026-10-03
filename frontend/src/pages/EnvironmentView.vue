@@ -12,6 +12,7 @@ import FilterBar, {
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
+import { useSegmentStore } from '@/stores/segmentStore'
 import { db, createId } from '@/utils/db'
 import {
   HUMIDITY_RANGE,
@@ -29,6 +30,7 @@ import type { TempZone } from '@/types/shelf'
 
 const milkStore = useMilkStore()
 const shelfStore = useShelfStore()
+const segmentStore = useSegmentStore()
 const { batches } = storeToRefs(milkStore)
 const { shelves } = storeToRefs(shelfStore)
 
@@ -45,6 +47,7 @@ const subscription = ref<{ unsubscribe: () => void } | null>(null)
 
 const form = reactive({
   batchId: '',
+  segmentId: null as string | null,
   recordedAt: '',
   tempC: 12,
   humidityPct: 85,
@@ -85,8 +88,15 @@ function subscribe(): void {
 onMounted(subscribe)
 onUnmounted(() => subscription.value?.unsubscribe())
 
-/** batchId → 所在窖位的温区；未上架批次按中温区默认判定 */
-function zoneOf(batchId: string): TempZone {
+/** 记录针对分段时，温区以该段所在窖位为准；否则取批次主窖位温区；未上架按中温区默认判定 */
+function zoneOf(batchId: string, segmentId?: string | null): TempZone {
+  const sid = segmentId ?? form.segmentId
+  if (sid) {
+    const segment = segmentStore.segmentMap[sid]
+    if (segment?.shelfId) {
+      return shelves.value.find((shelf) => shelf.id === segment.shelfId)?.tempZone ?? '中温区'
+    }
+  }
   const batch = batches.value.find((item) => item.id === batchId)
   if (!batch?.shelfId) return '中温区'
   return shelves.value.find((shelf) => shelf.id === batch.shelfId)?.tempZone ?? '中温区'
@@ -96,6 +106,32 @@ function batchLabelOf(batchId: string): string {
   const batch = batches.value.find((item) => item.id === batchId)
   if (!batch) return '批次已删除'
   return `${milkStore.milkNameOf(batch.milkId)} · ${batch.cheeseType} ${batch.curdedAt}`
+}
+
+function segmentLabelOf(segmentId: string | null): string {
+  if (!segmentId) return '整批'
+  const segment = segmentStore.segmentMap[segmentId]
+  if (!segment) return '分段已删除'
+  return `第 ${segment.blockNo} 段`
+}
+
+/** 当前选中批次下的分段选项（含「整批」） */
+const segmentOptions = computed(() => {
+  const list = segmentStore.segmentsOfBatch(form.batchId)
+  return [
+    { label: '整批（不指定段）', value: '' },
+    ...list.map((segment) => ({
+      label: `第 ${segment.blockNo} 段 · ${segment.weightKg}kg${
+        segment.shelfId ? ` · ${shelfStore.shelfLabel(segment.shelfId)}` : ' · 未上架'
+      }`,
+      value: segment.id
+    }))
+  ]
+})
+
+function onBatchChange(batchId: string): void {
+  const segments = segmentStore.segmentsOfBatch(batchId)
+  form.segmentId = segments[0]?.id ?? null
 }
 
 const batchOptions = computed(() =>
@@ -194,6 +230,7 @@ function openDialog(record?: Environment): void {
   if (record) {
     editingId.value = record.id
     form.batchId = record.batchId
+    form.segmentId = record.segmentId
     form.recordedAt = record.recordedAt
     form.tempC = record.tempC
     form.humidityPct = record.humidityPct
@@ -201,6 +238,7 @@ function openDialog(record?: Environment): void {
   } else {
     editingId.value = null
     form.batchId = batches.value[0]?.id ?? ''
+    form.segmentId = segmentStore.segmentsOfBatch(form.batchId)[0]?.id ?? null
     form.recordedAt = nowLocal()
     form.tempC = 12
     form.humidityPct = 85
@@ -220,6 +258,7 @@ async function submit(): Promise<void> {
   const record: Environment = {
     id: editingId.value ?? createId('env'),
     batchId: form.batchId,
+    segmentId: form.segmentId || null,
     recordedAt: form.recordedAt,
     tempC: form.tempC,
     humidityPct: form.humidityPct,
@@ -263,7 +302,7 @@ async function remarkAnomalies(): Promise<void> {
   const now = Date.now()
   await db.transaction('rw', db.environments, async () => {
     for (const record of all) {
-      const verdict = judgeEnvironment(record.tempC, record.humidityPct, zoneOf(record.batchId))
+      const verdict = judgeEnvironment(record.tempC, record.humidityPct, zoneOf(record.batchId, record.segmentId))
       if (record.anomaly !== !verdict.ok) {
         await db.environments.update(record.id, {
           anomaly: !verdict.ok,
@@ -277,8 +316,8 @@ async function remarkAnomalies(): Promise<void> {
   ElMessage.success(changed === 0 ? '全部记录标记已是最新' : `已按温区阈值重算 ${changed} 条记录`)
 }
 
-function zoneTextOf(batchId: string): string {
-  const zone = zoneOf(batchId)
+function zoneTextOf(batchId: string, segmentId?: string | null): string {
+  const zone = zoneOf(batchId, segmentId)
   const range = TEMP_RANGE[zone]
   return `${zone} ${range.min}-${range.max}℃`
 }
@@ -398,8 +437,15 @@ function zoneTextOf(batchId: string): string {
         <el-table-column label="批次" min-width="200">
           <template #default="{ row }">{{ batchLabelOf(row.batchId) }}</template>
         </el-table-column>
+        <el-table-column label="分段" width="100">
+          <template #default="{ row }">
+            <el-tag :type="row.segmentId ? 'warning' : 'info'" effect="plain" size="small">
+              {{ segmentLabelOf(row.segmentId) }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="温区" width="150">
-          <template #default="{ row }">{{ zoneTextOf(row.batchId) }}</template>
+          <template #default="{ row }">{{ zoneTextOf(row.batchId, row.segmentId) }}</template>
         </el-table-column>
         <el-table-column label="温度" width="90">
           <template #default="{ row }">
@@ -438,8 +484,15 @@ function zoneTextOf(batchId: string): string {
         <el-table-column label="批次" min-width="210">
           <template #default="{ row }">{{ batchLabelOf(row.batchId) }}</template>
         </el-table-column>
+        <el-table-column label="分段" width="100">
+          <template #default="{ row }">
+            <el-tag :type="row.segmentId ? 'warning' : 'info'" effect="plain" size="small">
+              {{ segmentLabelOf(row.segmentId) }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="温区 / 阈值" width="170">
-          <template #default="{ row }">{{ zoneTextOf(row.batchId) }}</template>
+          <template #default="{ row }">{{ zoneTextOf(row.batchId, row.segmentId) }}</template>
         </el-table-column>
         <el-table-column label="温度" width="100">
           <template #default="{ row }">
@@ -476,9 +529,25 @@ function zoneTextOf(batchId: string): string {
     >
       <el-form ref="formRef" :model="form" :rules="rules" label-width="110px">
         <el-form-item label="批次" prop="batchId">
-          <el-select v-model="form.batchId" filterable placeholder="选择批次" style="width: 100%">
+          <el-select
+            v-model="form.batchId"
+            filterable
+            placeholder="选择批次"
+            style="width: 100%"
+            @change="onBatchChange"
+          >
             <el-option
               v-for="option in batchOptions"
+              :key="option.value"
+              :label="option.label"
+              :value="option.value"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="记录分段">
+          <el-select v-model="form.segmentId" filterable placeholder="选择分段" style="width: 100%">
+            <el-option
+              v-for="option in segmentOptions"
               :key="option.value"
               :label="option.label"
               :value="option.value"

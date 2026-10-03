@@ -11,11 +11,14 @@ import FilterBar, {
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
+import { useSegmentStore } from '@/stores/segmentStore'
 import { TEMP_ZONES, createEmptyShelfFilter, type Shelf, type TempZone } from '@/types/shelf'
+import { splitWeightEvenly, type Segment } from '@/types/segment'
 import { TEMP_RANGE, ZONE_COLOR } from '@/utils/temperature'
 
 const shelfStore = useShelfStore()
 const milkStore = useMilkStore()
+const segmentStore = useSegmentStore()
 
 const {
   shelves,
@@ -27,17 +30,26 @@ const {
   totalOccupied,
   occupancyPercent,
   fullShelfCount,
-  unassignedBatches,
+  unassignedSegments,
   roomOptions,
   filteredShelves,
   roomShelves
 } = storeToRefs(shelfStore)
 
 const shelfFormRef = ref<FormInstance>()
-const assignFormRef = ref<FormInstance>()
+const placeFormRef = ref<FormInstance>()
+const splitFormRef = ref<FormInstance>()
+const moveFormRef = ref<FormInstance>()
 const shelfDialogVisible = ref(false)
-const assignDialogVisible = ref(false)
+const placeDialogVisible = ref(false)
+const splitDialogVisible = ref(false)
+const moveDialogVisible = ref(false)
 const editingShelfId = ref<string | null>(null)
+const movingSegment = ref<Segment | null>(null)
+
+const moveForm = reactive({
+  shelfId: ''
+})
 
 const shelfForm = reactive({
   room: '',
@@ -48,9 +60,14 @@ const shelfForm = reactive({
   occupied: 0
 })
 
-const assignForm = reactive({
-  batchId: '',
+const placeForm = reactive({
+  segmentId: '',
   shelfId: ''
+})
+
+const splitForm = reactive({
+  batchId: '',
+  blockCount: 2
 })
 
 const shelfRules: FormRules = {
@@ -61,9 +78,14 @@ const shelfRules: FormRules = {
   capacity: [{ required: true, message: '请填写可放块数', trigger: 'blur' }]
 }
 
-const assignRules: FormRules = {
-  batchId: [{ required: true, message: '请选择要上架的批次', trigger: 'change' }],
+const placeRules: FormRules = {
+  segmentId: [{ required: true, message: '请选择要落位的分段', trigger: 'change' }],
   shelfId: [{ required: true, message: '请选择目标窖位', trigger: 'change' }]
+}
+
+const splitRules: FormRules = {
+  batchId: [{ required: true, message: '请选择批次', trigger: 'change' }],
+  blockCount: [{ required: true, message: '请填写块数', trigger: 'blur' }]
 }
 
 const shelfFilterModel = computed<FilterModel>(() => ({
@@ -109,6 +131,20 @@ const filteredPercent = computed(() =>
     ? 0
     : Math.round((filteredOccupied.value / filteredCapacity.value) * 100)
 )
+
+/** 可分段落位的批次（未终态） */
+const splittableBatches = computed(() =>
+  milkStore.batches.filter((batch) => batch.state !== '已出库' && batch.state !== '报废')
+)
+
+/** 拆分预览：各段重量与合计 */
+const splitPreview = computed(() => {
+  const batch = milkStore.batches.find((item) => item.id === splitForm.batchId)
+  if (!batch) return { weights: [] as number[], total: 0, balanced: false }
+  const weights = splitWeightEvenly(batch.weightKg, splitForm.blockCount)
+  const total = Math.round(weights.reduce((sum, w) => sum + w, 0) * 10) / 10
+  return { weights, total, balanced: Math.abs(total - batch.weightKg) <= 0.05 }
+})
 
 function zoneRangeText(zone: TempZone): string {
   const range = TEMP_RANGE[zone]
@@ -173,10 +209,10 @@ async function submitShelf(): Promise<void> {
 }
 
 async function removeShelf(shelf: Shelf): Promise<void> {
-  const hosted = shelfStore.batchesOfShelf(shelf.id).length
+  const hosted = shelfStore.segmentsOfShelf(shelf.id).length
   try {
     await ElMessageBox.confirm(
-      `删除窖位「${shelfStore.shelfLabel(shelf.id)}」后，其上 ${hosted} 个批次会被置为未上架（批次与子记录保留）。是否继续？`,
+      `删除窖位「${shelfStore.shelfLabel(shelf.id)}」后，其上 ${hosted} 个分段会被置为未上架（批次与子记录保留）。是否继续？`,
       '删除窖位确认',
       { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
     )
@@ -184,21 +220,54 @@ async function removeShelf(shelf: Shelf): Promise<void> {
     return
   }
   await shelfStore.removeShelf(shelf.id)
-  ElMessage.success('窖位已删除，关联批次已置为未上架')
+  ElMessage.success('窖位已删除，关联分段已置为未上架')
 }
 
-function openAssignDialog(shelfId?: string): void {
-  assignForm.batchId = unassignedBatches.value[0]?.id ?? ''
-  assignForm.shelfId = shelfId ?? filteredShelves.value.find((shelf) => (occupancyMap.value[shelf.id]?.free ?? 0) > 0)?.id ?? ''
-  assignDialogVisible.value = true
+function openSplitDialog(): void {
+  splitForm.batchId = splittableBatches.value[0]?.id ?? ''
+  splitForm.blockCount = 2
+  splitDialogVisible.value = true
 }
 
-const assignPreview = computed(() => {
-  const occupancy = occupancyMap.value[assignForm.shelfId]
+async function submitSplit(): Promise<void> {
+  if (!splitFormRef.value) return
+  const valid = await splitFormRef.value.validate().catch(() => false)
+  if (!valid) return
+  const batch = milkStore.batches.find((item) => item.id === splitForm.batchId)
+  if (!batch) return
+  const existing = segmentStore.segmentsOfBatch(batch.id)
+  const placed = existing.filter((segment) => segment.shelfId !== null).length
+  if (placed > 0) {
+    try {
+      await ElMessageBox.confirm(
+        `该批次已有 ${placed} 个分段落位，重新拆分会释放这些分段并按 ${splitForm.blockCount} 块重新均分重量。是否继续？`,
+        '重新拆分确认',
+        { type: 'warning', confirmButtonText: '确认拆分', cancelButtonText: '取消' }
+      )
+    } catch {
+      return
+    }
+  }
+  const count = await segmentStore.splitBatch(batch.id, splitForm.blockCount)
+  ElMessage.success(`已按 ${count} 段拆分，各段重量合计 ${batch.weightKg}kg（守恒）`)
+  splitDialogVisible.value = false
+}
+
+function openPlaceDialog(shelfId?: string): void {
+  placeForm.segmentId = unassignedSegments.value[0]?.id ?? ''
+  placeForm.shelfId =
+    shelfId ??
+    filteredShelves.value.find((shelf) => (occupancyMap.value[shelf.id]?.free ?? 0) > 0)?.id ??
+    ''
+  placeDialogVisible.value = true
+}
+
+const placePreview = computed(() => {
+  const occupancy = occupancyMap.value[placeForm.shelfId]
   if (!occupancy) return null
   return {
     ...occupancy,
-    label: shelfStore.shelfLabel(assignForm.shelfId),
+    label: shelfStore.shelfLabel(placeForm.shelfId),
     after: Math.min(occupancy.capacity, occupancy.occupied + 1),
     afterPercent:
       occupancy.capacity === 0
@@ -207,39 +276,77 @@ const assignPreview = computed(() => {
   }
 })
 
-async function submitAssign(): Promise<void> {
-  if (!assignFormRef.value) return
-  const valid = await assignFormRef.value.validate().catch(() => false)
+async function submitPlace(): Promise<void> {
+  if (!placeFormRef.value) return
+  const valid = await placeFormRef.value.validate().catch(() => false)
   if (!valid) return
-  const result = await shelfStore.assignBatch(assignForm.batchId, assignForm.shelfId)
+  const segment = segmentStore.segmentMap[placeForm.segmentId]
+  const result = await segmentStore.placeSegment(
+    placeForm.segmentId,
+    placeForm.shelfId,
+    segment?.rev
+  )
   if (result.ok) {
     ElMessage.success(result.message)
-    assignDialogVisible.value = false
+    placeDialogVisible.value = false
   } else {
     ElMessage.warning(result.message)
   }
 }
 
-async function release(batchId: string): Promise<void> {
-  const result = await shelfStore.releaseBatch(batchId)
+async function releaseSegment(segment: Segment): Promise<void> {
+  const result = await segmentStore.releaseSegment(segment.id)
   if (result.ok) ElMessage.success(result.message)
   else ElMessage.warning(result.message)
 }
 
-async function assignBatchTo(shelfId: string, batchId: string): Promise<void> {
-  const result = await shelfStore.assignBatch(batchId, shelfId)
+async function placeOnShelf(shelfId: string, segmentId: string): Promise<void> {
+  const segment = segmentStore.segmentMap[segmentId]
+  const result = await segmentStore.placeSegment(segmentId, shelfId, segment?.rev)
   if (result.ok) ElMessage.success(result.message)
   else ElMessage.warning(result.message)
 }
 
-function batchesOnShelf(shelfId: string) {
-  return shelfStore.batchesOfShelf(shelfId)
+/** 已落位分段（跨窖位），用于挪窝 / 下架 */
+const placedSegments = computed(() =>
+  segmentStore.segments
+    .filter((segment) => segment.shelfId !== null)
+    .sort((a, b) => a.batchId.localeCompare(b.batchId) || a.blockNo - b.blockNo)
+)
+
+function openMoveDialog(segment: Segment): void {
+  movingSegment.value = segment
+  moveForm.shelfId = segment.shelfId ?? ''
+  moveDialogVisible.value = true
 }
 
-function batchOptionLabel(batchId: string): string {
-  const batch = milkStore.batches.find((item) => item.id === batchId)
-  if (!batch) return batchId
-  return `${milkStore.milkNameOf(batch.milkId)} · ${batch.cheeseType} ${batch.curdedAt}（${batch.weightKg}kg）`
+async function submitMove(): Promise<void> {
+  if (!movingSegment.value) return
+  if (!moveForm.shelfId) {
+    ElMessage.warning('请选择目标窖位')
+    return
+  }
+  const result = await segmentStore.moveSegment(
+    movingSegment.value.id,
+    moveForm.shelfId,
+    movingSegment.value.rev
+  )
+  if (result.ok) {
+    ElMessage.success(result.message)
+    moveDialogVisible.value = false
+  } else {
+    ElMessage.warning(result.message)
+  }
+}
+
+function segmentsOnShelf(shelfId: string) {
+  return shelfStore.segmentsOfShelf(shelfId)
+}
+
+function segmentOptionLabel(segment: Segment): string {
+  const batch = segmentStore.batchOf(segment.batchId)
+  if (!batch) return `第 ${segment.blockNo} 段 · ${segment.weightKg}kg`
+  return `${milkStore.milkNameOf(batch.milkId)} · ${batch.cheeseType} ${batch.curdedAt} · 第 ${segment.blockNo} 段（${segment.weightKg}kg）`
 }
 </script>
 
@@ -248,12 +355,18 @@ function batchOptionLabel(batchId: string): string {
     <div class="page-title">
       <div>
         <h2>熟成库货架与窖位</h2>
-        <p>按库房 / 货架 / 层号维护窖位，温区配置与占用率实时展示；上架时自动校验余量。</p>
+        <p>按库房 / 货架 / 层号维护窖位；一批可按块拆到多个窖位，每段落位占 1 块容量，重量合计守恒。</p>
       </div>
       <div>
         <el-button type="primary" :icon="Plus" @click="openShelfDialog()">新建窖位</el-button>
-        <el-button :icon="Position" :disabled="unassignedBatches.length === 0" @click="openAssignDialog()">
-          上架分配
+        <el-button :icon="Position" @click="openSplitDialog()">分段落位</el-button>
+        <el-button
+          :icon="Position"
+          type="success"
+          :disabled="unassignedSegments.length === 0"
+          @click="openPlaceDialog()"
+        >
+          落位分配
         </el-button>
       </div>
     </div>
@@ -273,9 +386,9 @@ function batchOptionLabel(batchId: string): string {
       />
       <StatBadge label="已满窖位" :value="fullShelfCount" suffix="个" icon="WarningFilled" tone="danger" />
       <StatBadge
-        label="待上架批次"
-        :value="unassignedBatches.length"
-        suffix="批"
+        label="待落位分段"
+        :value="unassignedSegments.length"
+        suffix="段"
         icon="AlarmClock"
         tone="success"
       />
@@ -313,7 +426,7 @@ function batchOptionLabel(batchId: string): string {
       <EmptyPanel
         v-if="ready && filteredShelves.length === 0"
         title="还没有符合条件窖位"
-        description="先按库房建立窖位（库房 + 货架号 + 层号 + 温区 + 可放块数），再回到批次台账把批次上架。"
+        description="先按库房建立窖位（库房 + 货架号 + 层号 + 温区 + 可放块数），再把批次分段落位。"
         action-text="新建窖位"
         @action="openShelfDialog()"
       />
@@ -352,19 +465,19 @@ function batchOptionLabel(batchId: string): string {
           <p class="muted zone-range">适宜温度 {{ zoneRangeText(shelf.tempZone) }}</p>
 
           <div class="shelf-card__batches">
-            <template v-if="batchesOnShelf(shelf.id).length > 0">
+            <template v-if="segmentsOnShelf(shelf.id).length > 0">
               <el-tag
-                v-for="batch in batchesOnShelf(shelf.id)"
-                :key="batch.id"
+                v-for="segment in segmentsOnShelf(shelf.id)"
+                :key="segment.id"
                 type="success"
                 effect="plain"
                 closable
-                @close="release(batch.id)"
+                @close="releaseSegment(segment)"
               >
-                {{ milkStore.milkNameOf(batch.milkId) }} · {{ batch.cheeseType }}
+                {{ segmentOptionLabel(segment) }}
               </el-tag>
             </template>
-            <span v-else class="muted">暂无批次</span>
+            <span v-else class="muted">暂无分段</span>
           </div>
 
           <footer class="shelf-card__actions">
@@ -372,10 +485,10 @@ function batchOptionLabel(batchId: string): string {
               text
               type="primary"
               :icon="Position"
-              :disabled="(occupancyMap[shelf.id]?.free ?? 0) <= 0 || unassignedBatches.length === 0"
-              @click="openAssignDialog(shelf.id)"
+              :disabled="(occupancyMap[shelf.id]?.free ?? 0) <= 0 || unassignedSegments.length === 0"
+              @click="openPlaceDialog(shelf.id)"
             >
-              上架
+              落位
             </el-button>
             <el-button text :icon="Edit" @click="openShelfDialog(shelf)">编辑</el-button>
             <el-button text type="danger" :icon="Delete" @click="removeShelf(shelf)">删除</el-button>
@@ -386,31 +499,37 @@ function batchOptionLabel(batchId: string): string {
 
     <div class="section-card">
       <div class="section-card__head">
-        <h3>待上架批次</h3>
-        <span class="muted">可直接选择窖位完成上架，余量不足时会给出提示</span>
+        <h3>待落位分段</h3>
+        <span class="muted">批次拆分后的未上架分段，选择窖位完成落位；余量不足时会提示并可重新选位</span>
       </div>
       <EmptyPanel
-        v-if="unassignedBatches.length === 0"
+        v-if="unassignedSegments.length === 0"
         compact
-        title="所有批次都已上架"
-        description="新建批次或先下架后再分配窖位。"
+        title="所有分段都已落位"
+        description="新建批次或先拆分后再分配窖位。"
       />
-      <el-table v-else :data="unassignedBatches" border stripe>
-        <el-table-column label="奶源" min-width="150">
-          <template #default="{ row }">{{ milkStore.milkNameOf(row.milkId) }}</template>
+      <el-table v-else :data="unassignedSegments" border stripe>
+        <el-table-column label="批次" min-width="200">
+          <template #default="{ row }">
+            {{ segmentOptionLabel(row) }}
+          </template>
         </el-table-column>
-        <el-table-column prop="cheeseType" label="类型" width="90" />
-        <el-table-column prop="curdedAt" label="凝乳日期" width="120" />
-        <el-table-column prop="targetDays" label="目标天数" width="100" />
+        <el-table-column label="段号" width="90">
+          <template #default="{ row }">第 {{ row.blockNo }} 段</template>
+        </el-table-column>
         <el-table-column prop="weightKg" label="重量 kg" width="100" />
-        <el-table-column prop="state" label="状态" width="100" />
+        <el-table-column label="入库重量" width="110">
+          <template #default="{ row }">
+            {{ segmentStore.batchOf(row.batchId)?.weightKg ?? '—' }} kg
+          </template>
+        </el-table-column>
         <el-table-column label="选择窖位" min-width="260">
           <template #default="{ row }">
             <el-select
               :model-value="''"
-              placeholder="选择窖位完成上架"
+              placeholder="选择窖位完成落位"
               style="width: 100%"
-              @update:model-value="(value: string) => assignBatchTo(value, row.id)"
+              @update:model-value="(value: string) => placeOnShelf(value, row.id)"
             >
               <el-option
                 v-for="shelf in roomShelves.length > 0 ? roomShelves : shelves"
@@ -420,6 +539,39 @@ function batchOptionLabel(batchId: string): string {
                 :disabled="(occupancyMap[shelf.id]?.free ?? 0) <= 0"
               />
             </el-select>
+          </template>
+        </el-table-column>
+      </el-table>
+    </div>
+
+    <div class="section-card">
+      <div class="section-card__head">
+        <h3>已落位分段（{{ placedSegments.length }}）</h3>
+        <span class="muted">每段占 1 块容量；可挪窝到其他窖位或下架，重量与作业历史随段走</span>
+      </div>
+      <EmptyPanel
+        v-if="placedSegments.length === 0"
+        compact
+        title="还没有已落位分段"
+        description="在上方「待落位分段」表格选择窖位完成落位。"
+      />
+      <el-table v-else :data="placedSegments" border stripe>
+        <el-table-column label="批次" min-width="220">
+          <template #default="{ row }">{{ segmentOptionLabel(row) }}</template>
+        </el-table-column>
+        <el-table-column label="段号" width="90">
+          <template #default="{ row }">第 {{ row.blockNo }} 段</template>
+        </el-table-column>
+        <el-table-column prop="weightKg" label="重量 kg" width="100" />
+        <el-table-column label="所在窖位" min-width="180">
+          <template #default="{ row }">
+            <el-tag type="success" effect="plain">{{ shelfStore.shelfLabel(row.shelfId) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="180" fixed="right">
+          <template #default="{ row }">
+            <el-button text type="primary" @click="openMoveDialog(row)">挪窝</el-button>
+            <el-button text type="danger" @click="releaseSegment(row)">下架</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -473,20 +625,59 @@ function batchOptionLabel(batchId: string): string {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="assignDialogVisible" title="批次上架分配" width="580px" destroy-on-close>
-      <el-form ref="assignFormRef" :model="assignForm" :rules="assignRules" label-width="110px">
+    <el-dialog v-model="splitDialogVisible" title="分段落位：按块拆分批次" width="560px" destroy-on-close>
+      <el-form ref="splitFormRef" :model="splitForm" :rules="splitRules" label-width="110px">
         <el-form-item label="批次" prop="batchId">
-          <el-select v-model="assignForm.batchId" placeholder="选择待上架批次" style="width: 100%">
+          <el-select v-model="splitForm.batchId" filterable placeholder="选择批次" style="width: 100%">
             <el-option
-              v-for="batch in unassignedBatches"
+              v-for="batch in splittableBatches"
               :key="batch.id"
-              :label="batchOptionLabel(batch.id)"
+              :label="`${milkStore.milkNameOf(batch.milkId)} · ${batch.cheeseType} ${batch.curdedAt}（${batch.weightKg}kg）`"
               :value="batch.id"
             />
           </el-select>
         </el-form-item>
+        <el-form-item label="拆成块数" prop="blockCount">
+          <el-input-number v-model="splitForm.blockCount" :min="1" :max="40" />
+        </el-form-item>
+        <el-alert
+          v-if="splitPreview.weights.length > 0"
+          :type="splitPreview.balanced ? 'success' : 'warning'"
+          :closable="false"
+          show-icon
+        >
+          <div>各段重量：{{ splitPreview.weights.map((w) => `${w}kg`).join('、') }}</div>
+          <div>
+            合计 {{ splitPreview.total }}kg
+            <template v-if="splitPreview.balanced">
+              = 入库重量 {{ segmentStore.batchOf(splitForm.batchId)?.weightKg }}kg（守恒）
+            </template>
+            <template v-else>
+              ≠ 入库重量 {{ segmentStore.batchOf(splitForm.batchId)?.weightKg }}kg，请调整块数
+            </template>
+          </div>
+        </el-alert>
+      </el-form>
+      <template #footer>
+        <el-button @click="splitDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitSplit">拆分并生成待落位分段</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="placeDialogVisible" title="分段落位分配" width="580px" destroy-on-close>
+      <el-form ref="placeFormRef" :model="placeForm" :rules="placeRules" label-width="110px">
+        <el-form-item label="分段" prop="segmentId">
+          <el-select v-model="placeForm.segmentId" filterable placeholder="选择待落位分段" style="width: 100%">
+            <el-option
+              v-for="segment in unassignedSegments"
+              :key="segment.id"
+              :label="segmentOptionLabel(segment)"
+              :value="segment.id"
+            />
+          </el-select>
+        </el-form-item>
         <el-form-item label="目标窖位" prop="shelfId">
-          <el-select v-model="assignForm.shelfId" placeholder="选择窖位" style="width: 100%">
+          <el-select v-model="placeForm.shelfId" filterable placeholder="选择窖位" style="width: 100%">
             <el-option
               v-for="shelf in shelves"
               :key="shelf.id"
@@ -497,16 +688,47 @@ function batchOptionLabel(batchId: string): string {
           </el-select>
         </el-form-item>
       </el-form>
-      <el-alert v-if="assignPreview" :type="assignPreview.full ? 'error' : 'success'" :closable="false" show-icon>
-        {{ assignPreview.label }}：当前 {{ assignPreview.occupied }} / {{ assignPreview.capacity }} 块，
-        上架后 {{ assignPreview.after }} / {{ assignPreview.capacity }} 块（占用率 {{ assignPreview.afterPercent }}%）
+      <el-alert v-if="placePreview" :type="placePreview.full ? 'error' : 'success'" :closable="false" show-icon>
+        {{ placePreview.label }}：当前 {{ placePreview.occupied }} / {{ placePreview.capacity }} 块，
+        落位后 {{ placePreview.after }} / {{ placePreview.capacity }} 块（占用率 {{ placePreview.afterPercent }}%）
       </el-alert>
       <el-alert v-else type="warning" :closable="false" show-icon>
-        请选择目标窖位，系统会实时校验余量。
+        请选择目标窖位，系统会实时校验余量；若被其他设备占满会提示重新选位。
       </el-alert>
       <template #footer>
-        <el-button @click="assignDialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="submitAssign">确认上架</el-button>
+        <el-button @click="placeDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitPlace">确认落位</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="moveDialogVisible" title="分段挪窝" width="520px" destroy-on-close>
+      <el-form ref="moveFormRef" :model="moveForm" label-width="110px">
+        <el-form-item label="分段">
+          <span v-if="movingSegment" class="muted">
+            {{ segmentOptionLabel(movingSegment) }}
+          </span>
+        </el-form-item>
+        <el-form-item label="目标窖位" required>
+          <el-select v-model="moveForm.shelfId" filterable placeholder="选择窖位" style="width: 100%">
+            <el-option
+              v-for="shelf in shelves"
+              :key="shelf.id"
+              :label="`${shelfStore.shelfLabel(shelf.id)}（${shelf.tempZone} 余 ${occupancyMap[shelf.id]?.free ?? 0} 块）`"
+              :value="shelf.id"
+              :disabled="
+                shelf.id === movingSegment?.shelfId ||
+                (occupancyMap[shelf.id]?.free ?? 0) <= 0
+              "
+            />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <el-alert type="info" :closable="false" show-icon>
+        挪窝只移动该分段，转架与环境记录随段保留；若目标窖位被其他设备占满会提示重新选位。
+      </el-alert>
+      <template #footer>
+        <el-button @click="moveDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitMove">确认挪窝</el-button>
       </template>
     </el-dialog>
   </section>

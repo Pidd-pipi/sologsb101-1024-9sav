@@ -44,7 +44,7 @@ docker compose up -d --build      # 代码改动后重新构建
 | 构建工具 | Vite 6 | 开发服务器端口 22824 |
 | 状态管理 | Pinia（setup store） | `milkStore` / `shelfStore` / `turningStore` / `tastingStore` |
 | 路由 | Vue Router 4（history 模式） | nginx 侧配合 `try_files` 做 SPA fallback |
-| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 库名 `gbcheeseage`，结构版本 `DB_VERSION = 2`，含真实 `.upgrade()` 迁移 |
+| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 库名 `gbcheeseage`，结构版本 `DB_VERSION = 3`，含真实 `.upgrade()` 迁移与分段落位 |
 | 图表 | 手写 SVG 折线（无额外依赖） | 温湿度双曲线 + 越界点标记 |
 | 拖拽排序 | HTML5 原生 `draggable` 事件 | 未引入 `vuedraggable` / `dnd-kit` 等任何新依赖 |
 | 容器化 | Docker 多阶段构建：`node:20-alpine` → `nginx:alpine` | 构建阶段执行类型检查与打包，运行阶段仅托管静态产物 |
@@ -108,19 +108,23 @@ sologsb101-1024/
 ## 五、IndexedDB 与数据存储说明
 
 - **数据库名**：`gbcheeseage`（Dexie 实例定义在 `frontend/src/utils/db.ts`）。
-- **结构版本**：`DB_VERSION = 2`。
+- **结构版本**：`DB_VERSION = 3`。
   - `version(1)`：初版六张业务表与索引。
   - `version(2).stores(...).upgrade(async (tx) => {...})`：**真实迁移**——为 `batches` 补齐 `shelfId` / `conclusion` / 时间戳；按作业日期为历史 `turnings` 回填 `seq` 执行序号；把湿度越界的 `environments` 记录重算为异常并补默认措施；把 `shelves` 的负数容量与占用数归零。
-- **六张表**：
+  - `version(3).stores(...).upgrade(async (tx) => {...})`：**分段落位**——新增 `segments` 分段表（一批按块拆到多个窖位，每段落位占 1 块容量，各段重量合计 = 批次入库重量）；为每个批次补建首段（整批一块，已上架的段落位到批次当前窖位）；按分段数重算窖位占用数；`turnings` / `environments` 补 `segmentId`（历史数据留空表示整批作业，新数据认到段）。
+- **七张表**：
 
 | 表 | 模型 | 关键字段 | 索引 |
 | --- | --- | --- | --- |
 | `milks` | Milk 奶源 | `farm` `milkKind`(牛/羊/水牛) `collectedAt` `fatPct` `proteinPct` `note` | id, farm, milkKind, collectedAt |
 | `batches` | Batch 生产批次 | `milkId` `curdedAt` `cheeseType`(硬质/软质/蓝纹/洗皮) `targetDays` `weightKg` `state` `shelfId` `conclusion` | id, milkId, shelfId, cheeseType, state, curdedAt |
 | `shelves` | Shelf 窖位 | `room` `rackNo` `layerNo` `tempZone`(冷区/中温区/常温区) `capacity` `occupied` | id, room, rackNo, tempZone, occupied |
-| `turnings` | Turning 转架作业 | `batchId` `shelfId` `doneAt` `type`(转架/翻面/擦洗) `brinePct` `operator` `state` `seq` | id, batchId, shelfId, doneAt, type, state, seq |
-| `environments` | Environment 环境记录 | `batchId` `recordedAt` `tempC` `humidityPct` `anomaly` `action` | id, batchId, recordedAt, anomaly |
+| `segments` | Segment 分段 | `batchId` `blockNo` `weightKg` `shelfId` `rev`(乐观锁版本) `note` | id, batchId, shelfId, blockNo |
+| `turnings` | Turning 转架作业 | `batchId` `segmentId` `shelfId` `doneAt` `type`(转架/翻面/擦洗) `brinePct` `operator` `state` `seq` | id, batchId, segmentId, shelfId, doneAt, type, state, seq |
+| `environments` | Environment 环境记录 | `batchId` `segmentId` `recordedAt` `tempC` `humidityPct` `anomaly` `action` | id, batchId, segmentId, recordedAt, anomaly |
 | `tastings` | Tasting 品评 | `batchId` `outAt` `appearance/flavor/texture` 描述 + 三维评分 `score` `conclusion` `taster` | id, batchId, outAt, score, conclusion |
+
+- **分段落位与并发控制**：批次建账时自动生成首段（整批一块，未上架）；`/shelves` 页「分段落位」按块数均分入库重量（末段补齐余数，保证合计 = 入库重量），逐段落位到窖位。落位 / 挪窝在 Dexie 读写事务内二次校验：段版本号 `rev` 一致（先写者胜）+ 窖位余量（段数 < 容量）。两个平板同时保存同一段时，先写的占用保留，后到的看到余量提示后重新选位，不会两段共占一格。转架作业与环境记录都认到具体段（`segmentId`），出库品评再合回批次结论。
 
 - **首屏自动播种**：`initDatabase()` 在 `db.open()` 后执行 `if ((await db.milks.count()) === 0) { await seedDatabase() }`，播种 3 层互相引用的演示数据（奶源 3 → 生产批次 4 → 转架 4 / 环境 4 / 品评 3），使用固定 id + `bulkPut`，**幂等**（重复调用不会产生重复记录）。
 - **localStorage**：仅存元数据 —— `gbcheeseage:db-version`（本地结构版本）、`gbcheeseage:last-backup-at`（最近一次导出时间）、`gbcheeseage:ui-prefs`（当前库房、作业排序方式、曲线指标）。

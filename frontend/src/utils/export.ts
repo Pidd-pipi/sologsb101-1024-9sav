@@ -15,10 +15,11 @@ export interface ParseResult {
   payload: BackupPayload | null
 }
 
-const COLLECTIONS: Array<keyof Pick<BackupPayload, 'milks' | 'batches' | 'shelves' | 'turnings' | 'environments' | 'tastings'>> = [
+const COLLECTIONS: Array<keyof Pick<BackupPayload, 'milks' | 'batches' | 'shelves' | 'segments' | 'turnings' | 'environments' | 'tastings'>> = [
   'milks',
   'batches',
   'shelves',
+  'segments',
   'turnings',
   'environments',
   'tastings'
@@ -53,6 +54,7 @@ export function validatePayload(input: unknown): ParseResult {
     milks: (obj.milks ?? []).filter((item) => typeof item?.id === 'string'),
     batches: (obj.batches ?? []).filter((item) => typeof item?.id === 'string'),
     shelves: (obj.shelves ?? []).filter((item) => typeof item?.id === 'string'),
+    segments: (obj.segments ?? []).filter((item) => typeof item?.id === 'string'),
     turnings: (obj.turnings ?? []).filter((item) => typeof item?.id === 'string'),
     environments: (obj.environments ?? []).filter((item) => typeof item?.id === 'string'),
     tastings: (obj.tastings ?? []).filter((item) => typeof item?.id === 'string')
@@ -61,22 +63,38 @@ export function validatePayload(input: unknown): ParseResult {
     errors.push('文件中没有任何奶源或批次记录')
     return { ok: false, errors, payload: null }
   }
-  // 引用完整性校验：批次的奶源、转架/环境/品评的批次必须能在文件内找到
+  // 引用完整性校验：批次的奶源、分段的批次与窖位、转架/环境/品评的批次必须能在文件内找到
   const milkIds = new Set(payload.milks.map((item) => item.id))
   const batchIds = new Set(payload.batches.map((item) => item.id))
+  const shelfIds = new Set(payload.shelves.map((item) => item.id))
+  const segmentIds = new Set(payload.segments.map((item) => item.id))
   payload.batches.forEach((batch) => {
     if (!milkIds.has(batch.milkId)) {
       errors.push(`批次 ${batch.id} 引用了不存在的奶源 ${batch.milkId}`)
+    }
+  })
+  payload.segments.forEach((segment) => {
+    if (!batchIds.has(segment.batchId)) {
+      errors.push(`分段 ${segment.id} 引用了不存在的批次 ${segment.batchId}`)
+    }
+    if (segment.shelfId && !shelfIds.has(segment.shelfId)) {
+      errors.push(`分段 ${segment.id} 引用了不存在的窖位 ${segment.shelfId}`)
     }
   })
   payload.turnings.forEach((turning) => {
     if (!batchIds.has(turning.batchId)) {
       errors.push(`转架作业 ${turning.id} 引用了不存在的批次 ${turning.batchId}`)
     }
+    if (turning.segmentId && !segmentIds.has(turning.segmentId)) {
+      errors.push(`转架作业 ${turning.id} 引用了不存在的分段 ${turning.segmentId}`)
+    }
   })
   payload.environments.forEach((record) => {
     if (!batchIds.has(record.batchId)) {
       errors.push(`环境记录 ${record.id} 引用了不存在的批次 ${record.batchId}`)
+    }
+    if (record.segmentId && !segmentIds.has(record.segmentId)) {
+      errors.push(`环境记录 ${record.id} 引用了不存在的分段 ${record.segmentId}`)
     }
   })
   payload.tastings.forEach((tasting) => {
@@ -126,10 +144,11 @@ function stamp(): string {
 
 /** 导出全量档案 JSON */
 export async function exportSnapshotJson(): Promise<{ fileName: string; counts: Record<string, number> }> {
-  const [milks, batches, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, batches, shelves, segments, turnings, environments, tastings] = await Promise.all([
     db.milks.toArray(),
     db.batches.toArray(),
     db.shelves.toArray(),
+    db.segments.toArray(),
     db.turnings.toArray(),
     db.environments.toArray(),
     db.tastings.toArray()
@@ -141,6 +160,7 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
     milks,
     batches,
     shelves,
+    segments,
     turnings,
     environments,
     tastings
@@ -154,6 +174,7 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
       milks: milks.length,
       batches: batches.length,
       shelves: shelves.length,
+      segments: segments.length,
       turnings: turnings.length,
       environments: environments.length,
       tastings: tastings.length
@@ -161,15 +182,16 @@ export async function exportSnapshotJson(): Promise<{ fileName: string; counts: 
   }
 }
 
-/** 导出单个批次的熟成档案（含奶源、窖位、转架、环境与品评） */
+/** 导出单个批次的熟成档案（含奶源、窖位、分段、转架、环境与品评） */
 export async function exportBatchArchiveJson(
   batchId: string
 ): Promise<{ fileName: string; counts: Record<string, number> }> {
   const batch = await db.batches.get(batchId)
   if (!batch) throw new Error('批次不存在，无法导出')
-  const [milks, shelves, turnings, environments, tastings] = await Promise.all([
+  const [milks, shelves, segments, turnings, environments, tastings] = await Promise.all([
     db.milks.toArray(),
     db.shelves.toArray(),
+    db.segments.where('batchId').equals(batchId).toArray(),
     db.turnings.where('batchId').equals(batchId).toArray(),
     db.environments.where('batchId').equals(batchId).toArray(),
     db.tastings.where('batchId').equals(batchId).toArray()
@@ -183,6 +205,7 @@ export async function exportBatchArchiveJson(
     milks: milks.filter((milk) => milk.id === batch.milkId),
     batches: [batch],
     shelves: shelves.filter((shelf) => shelf.id === batch.shelfId),
+    segments,
     turnings,
     environments,
     tastings
@@ -195,6 +218,7 @@ export async function exportBatchArchiveJson(
       milks: archive.milks.length,
       batches: 1,
       shelves: archive.shelves.length,
+      segments: segments.length,
       turnings: turnings.length,
       environments: environments.length,
       tastings: tastings.length
@@ -210,11 +234,12 @@ export async function importSnapshotJson(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.milks, db.batches, db.shelves, db.turnings, db.environments, db.tastings],
+    [db.milks, db.batches, db.shelves, db.segments, db.turnings, db.environments, db.tastings],
     async () => {
       await db.milks.bulkPut(payload.milks)
       await db.batches.bulkPut(payload.batches)
       await db.shelves.bulkPut(payload.shelves)
+      await db.segments.bulkPut(payload.segments ?? [])
       await db.turnings.bulkPut(payload.turnings)
       await db.environments.bulkPut(payload.environments)
       await db.tastings.bulkPut(payload.tastings)
@@ -224,6 +249,7 @@ export async function importSnapshotJson(
     milks: payload.milks.length,
     batches: payload.batches.length,
     shelves: payload.shelves.length,
+    segments: (payload.segments ?? []).length,
     turnings: payload.turnings.length,
     environments: payload.environments.length,
     tastings: payload.tastings.length
@@ -235,6 +261,7 @@ export function remapPayloadIds(payload: BackupPayload): BackupPayload {
   const milkIdMap = new Map<string, string>()
   const batchIdMap = new Map<string, string>()
   const shelfIdMap = new Map<string, string>()
+  const segmentIdMap = new Map<string, string>()
 
   const milks = payload.milks.map((milk) => {
     const id = createId('milk')
@@ -256,16 +283,28 @@ export function remapPayloadIds(payload: BackupPayload): BackupPayload {
       shelfId: batch.shelfId ? shelfIdMap.get(batch.shelfId) ?? null : null
     }
   })
+  const segments = payload.segments.map((segment) => {
+    const id = createId('seg')
+    segmentIdMap.set(segment.id, id)
+    return {
+      ...segment,
+      id,
+      batchId: batchIdMap.get(segment.batchId) ?? segment.batchId,
+      shelfId: segment.shelfId ? shelfIdMap.get(segment.shelfId) ?? null : null
+    }
+  })
   const turnings = payload.turnings.map((turning) => ({
     ...turning,
     id: createId('turn'),
     batchId: batchIdMap.get(turning.batchId) ?? turning.batchId,
+    segmentId: turning.segmentId ? segmentIdMap.get(turning.segmentId) ?? null : null,
     shelfId: shelfIdMap.get(turning.shelfId) ?? turning.shelfId
   }))
   const environments = payload.environments.map((record) => ({
     ...record,
     id: createId('env'),
-    batchId: batchIdMap.get(record.batchId) ?? record.batchId
+    batchId: batchIdMap.get(record.batchId) ?? record.batchId,
+    segmentId: record.segmentId ? segmentIdMap.get(record.segmentId) ?? null : null
   }))
   const tastings = payload.tastings.map((tasting) => ({
     ...tasting,
@@ -273,5 +312,5 @@ export function remapPayloadIds(payload: BackupPayload): BackupPayload {
     batchId: batchIdMap.get(tasting.batchId) ?? tasting.batchId
   }))
 
-  return { ...payload, milks, batches, shelves, turnings, environments, tastings }
+  return { ...payload, milks, batches, shelves, segments, turnings, environments, tastings }
 }
